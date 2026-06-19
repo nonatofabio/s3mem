@@ -23,6 +23,11 @@ pub enum Error {
 
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// A remote/backend failure (e.g. an S3 request error), rendered as a message so the
+    /// error type stays free of any backend SDK in the default build.
+    #[error("backend error: {0}")]
+    Backend(String),
 }
 
 impl Error {

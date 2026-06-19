@@ -4,19 +4,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status: early scaffold (Rust)
 
-The crate ships the **format layer** ([`Record`]) and the **local-filesystem backend**
-([`LocalStore`]) from the architecture below. The S3 backend, search/recall, and an agent
-CLI are not built yet. The architecture section is the design of record — build outward
-from here and keep this file current as tooling lands.
+The crate ships the **format layer** ([`Record`]), the **local-filesystem backend**
+([`LocalStore`]), and the **S3 backend** ([`S3Store`], behind the `s3` feature) — both
+implementing the same [`Store`] trait. Search/recall and an agent CLI are not built yet. The
+architecture section is the design of record — build outward from here and keep this file
+current as tooling lands.
 
 ### Commands
 
 ```bash
-cargo test               # unit + integration + doctests
-cargo test --test local_store           # just the local-FS integration tests
-cargo test round_trips_through_markdown # a single test by name
-cargo clippy --all-targets              # lints (kept clean)
-cargo fmt                               # format (rustfmt)
+cargo test               # core suite (unit + integration + doctests), no AWS deps
+cargo test --features s3                 # also builds S3 backend + its key-construction tests
+cargo build --features s3                # compile the S3 backend (pulls the AWS SDK)
+cargo test --test local_store            # just the local-FS integration tests
+cargo test round_trips_through_markdown  # a single test by name
+cargo clippy --all-targets [--features s3]   # lints (kept clean on both feature sets)
+cargo fmt                                # format (rustfmt)
+
+# Live S3 round-trip (skipped unless a bucket + AWS creds are present):
+S3MEM_TEST_BUCKET=my-bucket cargo test --features s3 --test s3_store -- --nocapture
 ```
 
 ### Source layout
@@ -29,14 +35,28 @@ src/
   error.rs          Error enum (thiserror), Result alias
   util.rs           now_iso() RFC-3339 timestamp helper
   backend/
-    mod.rs          backend module (reference backend now; S3 later)
+    mod.rs          backend module wiring (common + local, s3 under cfg)
+    common.rs       SHARED key rules: validate_id, encode_id, safe_segments (parity-critical)
     local.rs        LocalStore — Store over a directory
+    s3.rs           S3Store — Store over S3 objects (feature = "s3")
 tests/local_store.rs  integration tests against a temp-dir bundle
+tests/qa_probes.rs    adversarial corner-case suite (see QA_FINDINGS.md)
+tests/s3_store.rs     live S3 round-trip, gated on S3MEM_TEST_BUCKET (feature = "s3")
 ```
 
 Key implementation notes for future work:
-- `Store` is the seam. The S3 backend is a new sibling under `backend/` implementing the
-  same trait — callers don't change. Keep S3-only concerns out of `store.rs`.
+- `Store` is the seam, and it's **synchronous**. The AWS SDK is async, so `S3Store` owns a
+  Tokio runtime and bridges each call with `block_on` — this keeps the trait, the local
+  backend, and all callers sync. Don't asyncify the trait to accommodate S3.
+- **Backend parity is load-bearing.** `validate_id`, `encode_id`, and namespace containment
+  live in `backend/common.rs` and are used identically by both backends, so a bundle written
+  locally is byte-for-byte the same on S3 (and vice versa) — that's the "ship it around"
+  promise. Any third backend MUST reuse `common.rs`, not reinvent key rules.
+- `get`/`delete` resolve a record by its **frontmatter id**: a fast path at the canonical
+  `encode_id(id)` key, then a fallback scan for files/objects whose on-disk name diverges
+  (renames, hand-edits). Keep `get`/`delete` consistent with what `list`/`manifest` report.
+- The S3 backend is **off by default** to keep the core crate AWS-free; gate any future
+  AWS-only code behind `#[cfg(feature = "s3")]`.
 - `manifest.json` + `index.md` are **derived on every write** (`LocalStore::reindex`) and
   are never authoritative. `manifest()`/`list()` go through `read_entries`, which **skips +
   warns on unparseable files** rather than failing the whole bundle — a stray non-OKF `.md`

@@ -11,6 +11,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::backend::common::{encode_id, safe_segments, validate_id};
 use crate::error::{Error, Result};
 use crate::record::Record;
 use crate::store::{Manifest, ManifestEntry, Store};
@@ -36,13 +37,10 @@ impl LocalStore {
     ///
     /// The namespace is split on path separators and any empty / `.` / `..` component is
     /// dropped, so a hostile namespace like `../escape` is contained inside `root` rather
-    /// than escaping it (record ids get the same treatment via [`validate_id`]).
+    /// than escaping it (record ids get the same treatment via `validate_id`).
     pub fn bundle_dir(&self) -> PathBuf {
         let mut dir = self.root.clone();
-        for part in self.namespace.split(['/', '\\']) {
-            if part.is_empty() || part == "." || part == ".." {
-                continue;
-            }
+        for part in safe_segments(&self.namespace) {
             dir.push(part);
         }
         dir
@@ -112,40 +110,6 @@ impl LocalStore {
     }
 }
 
-/// Ids become filenames, so they're held to an allowlist: ASCII alphanumerics plus
-/// `-`, `_`, `.` — and never the traversal tokens `.`/`..`. This rejects path separators,
-/// control characters (newlines), spaces and unicode up front, rather than denylisting a
-/// handful of known-bad characters.
-fn validate_id(id: &str) -> Result<()> {
-    let allowed = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.');
-    let bad =
-        id.is_empty() || id == "." || id == ".." || id.contains("..") || !id.bytes().all(allowed);
-    if bad {
-        return Err(Error::InvalidId(id.to_string()));
-    }
-    Ok(())
-}
-
-/// Encode an (already validated) id into a case-insensitive-collision-free filename stem.
-///
-/// Uppercase ASCII letters are percent-escaped with lowercase hex, so every filename is
-/// all-lowercase and the encoding is injective. Two ids that differ only by case (`Alpha`
-/// vs `alpha`) therefore map to distinct filenames that don't collapse on a
-/// case-insensitive filesystem (macOS APFS, Windows NTFS) — preserving the "ship a bundle
-/// around unchanged" invariant across backends.
-fn encode_id(id: &str) -> String {
-    let mut out = String::with_capacity(id.len());
-    for b in id.bytes() {
-        if b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.') {
-            out.push(b as char);
-        } else {
-            out.push('%');
-            out.push_str(&format!("{b:02x}"));
-        }
-    }
-    out
-}
-
 impl Store for LocalStore {
     fn put(&self, record: &Record) -> Result<()> {
         validate_id(&record.meta.id)?;
@@ -161,15 +125,20 @@ impl Store for LocalStore {
 
     fn get(&self, id: &str) -> Result<Record> {
         validate_id(id)?;
-        let path = self.record_path(id);
-        let text = match fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Error::NotFound(id.to_string()))
+        // Fast path: the canonical filename for this id.
+        if let Some(record) = read_record_at(&self.record_path(id))? {
+            if record.meta.id == id {
+                return Ok(record);
             }
-            Err(e) => return Err(Error::io(&path, e)),
-        };
-        Record::parse(&text)
+        }
+        // Fallback: a file whose on-disk name diverges from its frontmatter id (a rename or
+        // hand-edit). `list()`/`manifest()` report records by frontmatter id, so `get` must
+        // be able to reach them the same way.
+        self.read_entries()?
+            .into_iter()
+            .find(|(_, record)| record.meta.id == id)
+            .map(|(_, record)| record)
+            .ok_or_else(|| Error::NotFound(id.to_string()))
     }
 
     fn list(&self) -> Result<Vec<String>> {
@@ -184,15 +153,25 @@ impl Store for LocalStore {
 
     fn delete(&self, id: &str) -> Result<()> {
         validate_id(id)?;
-        let path = self.record_path(id);
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Error::NotFound(id.to_string()))
+        // Resolve to the file that actually holds this id: the canonical path if it matches,
+        // otherwise the diverging file found by scanning frontmatter ids.
+        let canonical = self.record_path(id);
+        let target = if read_record_at(&canonical)?.is_some_and(|r| r.meta.id == id) {
+            Some(canonical)
+        } else {
+            self.read_entries()?
+                .into_iter()
+                .find(|(_, record)| record.meta.id == id)
+                .map(|(key, _)| self.bundle_dir().join(key))
+        };
+
+        match target {
+            Some(path) => {
+                fs::remove_file(&path).map_err(|e| Error::io(&path, e))?;
+                self.reindex()
             }
-            Err(e) => return Err(Error::io(&path, e)),
+            None => Err(Error::NotFound(id.to_string())),
         }
-        self.reindex()
     }
 
     fn manifest(&self) -> Result<Manifest> {
@@ -211,4 +190,13 @@ impl Store for LocalStore {
 
 fn is_markdown(path: &Path) -> bool {
     path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md")
+}
+
+/// Read and parse the record at `path`, or `Ok(None)` if the file doesn't exist.
+fn read_record_at(path: &Path) -> Result<Option<Record>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(Record::parse(&text)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::io(path, e)),
+    }
 }

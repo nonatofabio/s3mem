@@ -1,111 +1,108 @@
 # S3Mem — QA corner-case findings
 
-Adversarial QA pass against the early scaffold (format layer + `LocalStore`). Goal: disprove
-the assumptions the README/architecture make about the format, the store, and the "ship a
-bundle around unchanged" portability claim.
+Adversarial QA against the early scaffold (format layer + `LocalStore`). Goal: disprove the
+assumptions the README/architecture make about the format, the store, and the "ship a bundle
+around unchanged" portability claim.
 
-**Method.** Baseline suite (9 tests) was green. I added 13 corner-case probes in
-[`tests/qa_probes.rs`](tests/qa_probes.rs). Each probe asserts the *correct* behavior, so a
-**failing test is a confirmed defect**. Result: **9 failed, 4 passed.** No production code was
-changed — this is a QA pass, not a fix.
-
-Reproduce:
+**Method.** Probes live in [`tests/qa_probes.rs`](tests/qa_probes.rs). Each asserts the
+*correct* behavior, so a **failing test is a confirmed defect**.
 
 ```bash
-cargo test --test qa_probes        # 9 of these FAIL on purpose — each failure is a defect
+cargo test --test qa_probes
 ```
 
 ---
 
-## Confirmed defects
+## Round 1 — all 9 defects FIXED ✅
 
-### HIGH-1 — A single stray file bricks every write
-- **Test:** `one_bad_file_does_not_poison_the_bundle` (FAIL)
-- **Where:** `backend/local.rs::manifest()` → called by `reindex()` on every `put`/`delete`.
-- **What:** `manifest()` does `list()` then `get()` on *every* `.md` file and propagates the
-  first parse error. Drop one non-OKF markdown file into `memories/` (e.g. a human `README.md`
-  — exactly the "it's just files" workflow the README sells) and **every subsequent `put`,
-  `delete`, and `manifest()` fails**.
-- **Contradicts:** architecture claim that the manifest "is always reconstructable by listing +
-  reading the `memories/` objects."
-- **Fix direction:** skip + warn on unparseable files instead of failing the whole bundle.
+The first pass found 9 defects (2 High, 4 Medium, 2 Low). All are now fixed and the original
+13 probes pass. Verified against the current tree:
 
-### HIGH-2 — Namespace bypasses traversal protection
-- **Test:** `namespace_traversal_writes_outside_root` (FAIL)
-- **Where:** `LocalStore::new` / `bundle_dir()` — `root.join(namespace)` with no validation.
-- **What:** `validate_id` carefully blocks `..` / `/` in record ids, but `namespace` is
-  completely unguarded. `LocalStore::new(root, "../ESCAPED")` writes records **outside** the
-  bundle root. The traversal defense is asymmetric: id guarded, namespace wide open.
-- **Fix direction:** validate `namespace` with the same (or stricter) rules as `id`.
+| # | Defect | Fix landed | Probe (now passing) |
+|---|--------|-----------|---------------------|
+| HIGH-1 | One stray `.md` bricked every write | `read_entries` skips + warns on unparseable files | `one_bad_file_does_not_poison_the_bundle` |
+| HIGH-2 | `namespace` bypassed traversal guard | `bundle_dir` drops `.`/`..`/empty components | `namespace_traversal_writes_outside_root` |
+| MED-1 | Case-only-distinct ids collided on case-insensitive FS | `encode_id` percent-escapes uppercase → injective lowercase stems | `case_distinct_ids_do_not_collide` |
+| MED-2 | Hand-added frontmatter silently dropped | `RecordMeta.extra` via `#[serde(flatten)]` | `unknown_frontmatter_field_is_preserved` |
+| MED-3 | Newline in `description` spliced raw line into `index.md` | `one_line()` collapses control chars | `description_with_newline_keeps_index_wellformed` |
+| MED-4 | `validate_id` denylist accepted `.` and newlines | Allowlist `[A-Za-z0-9._-]`, reject `.`/`..` | `dot_id_rejected`, `newline_id_rejected` |
+| LOW-1 | Leading whitespace lost in body round-trip | `parse` slices body from raw bytes (no trim) | `body_leading_whitespace_round_trips` |
+| LOW-2 | CRLF bodies normalized to LF | same byte-faithful parser | `body_crlf_round_trips` |
 
 ---
 
-## Medium
+## Round 2 — expanded scenarios
 
-### MED-1 — "Ship around" portability invariant breaks on case-insensitive filesystems
-- **Test:** `case_distinct_ids_do_not_collide` (FAIL)
-- **What:** ids `Alpha` and `alpha` are distinct format keys, but on macOS APFS / Windows NTFS
-  they map to one file — the second `put` **silently overwrites** the first. A bundle authored
-  on case-sensitive Linux **loses records** when synced to a Mac.
-- **Contradicts:** "a bundle round-trips between cloud and disk unchanged." S3 *is*
-  case-sensitive, so the same bundle will behave differently across backends. (Unicode NFC/NFD
-  normalization on macOS is the same class of bug — untested here, worth adding.)
-- **Fix direction:** decide a case/normalization policy at the format layer before S3 lands.
+Probed the **new surface the fix introduced** (`encode_id`, `extra`, namespace normalization,
+the rewritten byte-faithful parser) plus areas not covered before (store-level round-trips,
+concurrency, resource limits). **23 pass, 2 new defects.**
 
-### MED-2 — Hand-editing silently loses data
-- **Test:** `unknown_frontmatter_field_is_preserved` (FAIL)
-- **What:** `RecordMeta` has no `deny_unknown_fields` and no catch-all. Any frontmatter field a
-  human adds (`importance:`, `author:`, …) is **silently dropped** the next time an agent
-  `put`s that record.
-- **Contradicts:** README pitch of OKF as "git-native, hand-editable." The format isn't
-  lossless against hand edits.
-- **Fix direction:** `#[serde(flatten)] extra: BTreeMap<String, Value>` to preserve unknowns.
-
-### MED-3 — `index.md` is corruptible via `description`
-- **Test:** `description_with_newline_keeps_index_wellformed` (FAIL)
-- **What:** `description` isn't constrained to one line. A newline (or `)` / `]`) round-trips
-  fine as YAML data but `to_index_md` splices it raw into the link row:
+### NEW MED-5 — `extra` shadowing a known field produces unparseable output
+- **Test:** `extra_shadowing_known_field_round_trips` (FAIL)
+- **What:** `#[serde(flatten)] extra` is written *after* the named struct fields. If `extra`
+  contains a key that collides with a known field (`id`, `type`, `description`, …), the YAML
+  gets a **duplicate key**:
+  ```yaml
+  id: real-id
+  ...
+  id: ghost          # <- from extra
   ```
-  - [`x`](memories/x.md) — real desc
-  INJECTED LINE _(semantic)_
-  ```
-- **Fix direction:** sanitize/escape `description` (and `id`) when rendering `index.md`.
+  `Record::parse` then fails with `duplicate field 'id'`. So `parse(to_markdown(r))` is **not
+  total** — there exist constructible `Record`s whose own serialization can't be read back.
+  The round-trip fix closed the *unknown-field* gap but opened a *shadowing* gap.
+- **Severity:** Medium. Reachable from the public API (`RecordMeta.extra` is `pub`); a tool
+  that copies frontmatter into `extra`, or a future `link()`/migration that manipulates it,
+  can write a record that can never be read back.
+- **Fix direction:** on parse, deny extra keys that match reserved names (serde already does at
+  read time — the problem is the *write*); or strip reserved keys from `extra` in
+  `to_markdown`; or validate `extra` in `put`.
 
-### MED-4 — Id validation gaps (denylist instead of allowlist)
-- **Tests:** `dot_id_rejected` (FAIL), `newline_id_rejected` (FAIL)
-- **What:** `validate_id` is a denylist (`/`, `\`, `..`, separator). It accepts `id = "."`
-  (→ file literally named `..md`) and `id = "a\nb"` (control chars / newline → garbage filename
-  and a corrupt-looking manifest key).
-- **Fix direction:** switch to an allowlist matching the "stable-kebab-slug" contract.
+### NEW MED-6 — Filename / frontmatter-id divergence makes a record visible but unreachable
+- **Test:** `divergent_record_is_reachable_via_get` (FAIL)
+- **What:** `list()` and `manifest()` derive the id from each record's **frontmatter**, while
+  `get()`/`delete()` derive the **filename** from the id via `encode_id`. They agree only when
+  the on-disk stem equals `encode_id(frontmatter_id)`. A file `memories/on-disk-name.md` whose
+  frontmatter says `id: frontmatter-id` is:
+  - **listed** as `frontmatter-id`,
+  - but `get("frontmatter-id")` → `NotFound`, and `delete("frontmatter-id")` → `NotFound`.
+
+  The record is **stuck**: shown in the index, un-fetchable, un-deletable. Triggers on any
+  rename, hand-edit, or `aws s3 cp` to a different key — i.e. exactly the "ship a bundle
+  around" workflow. The manifest `key` is correct (real filename), so a *key-addressed* fetch
+  would work, but the `Store` trait only offers id-addressed `get`/`delete`.
+- **Severity:** Medium. Self-inflicted only via external file moves today, but it's a latent
+  inconsistency between the two id-resolution paths that the S3 backend will inherit.
+- **Fix direction:** make `list()`/`manifest()` report the id that `get()` can actually
+  resolve (derive id from filename, or verify `encode_id(frontmatter_id) == stem` and warn on
+  mismatch), so the two paths can never disagree.
+
+### New scenarios that PASSED (defenses confirmed)
+
+- **Store-level losslessness:** `store_preserves_extra_through_put_get`,
+  `body_round_trips_through_store` (CRLF + leading-whitespace + tabs survive `put`→`get`).
+- **encode_id injectivity:** `percent_id_is_rejected` (the `%` escape char can't be a legal
+  id), `case_distinct_ids_keep_distinct_content` (both `Alpha` and `alpha` retrievable with
+  their own bodies).
+- **Body parser edge cases:** `empty_body_round_trips`, `leading_blank_line_body_round_trips`,
+  `trailing_newlines_body_round_trips`.
+- **Namespace normalization:** `empty_namespace_stays_in_root` (empty / dot-only / `../..`
+  namespaces collapse into the root, no escape, no panic).
+- **Concurrency:** `concurrent_puts_are_all_visible` — 32 threads writing distinct ids; all
+  records visible afterward (the API rebuilds from record files, not the cached manifest).
+  *Note:* the persisted `manifest.json`/`index.md` can momentarily lag under concurrent
+  writers since each `put` rewrites them whole and the last writer wins — harmless because
+  they're derived and never read back by the code, but worth a line in the docs.
+- **Resource limits:** `overlong_id_fails_gracefully` — a 5000-char id errors or is accepted
+  by the FS, but never panics and never silently truncates into a collision.
 
 ---
 
-## Low — body round-trip is not byte-faithful
+## Recommended priority order (remaining)
 
-- **`body_leading_whitespace_round_trips` (FAIL):** `to_markdown` does `trim_end()` but `parse`
-  does `trim()`, so **leading** whitespace (indented code blocks) is lost on round-trip.
-- **`body_crlf_round_trips` (FAIL):** `.lines()` strips `\r`, so CRLF bodies (Windows authoring)
-  silently normalize to LF. Bodies aren't preserved verbatim.
-
----
-
-## Probes that confirmed behavior is sound (4 passed)
-
-- `body_with_triple_dash_round_trips` — a `---` horizontal rule inside the body survives.
-- `padded_dashes_in_frontmatter_region` — whitespace-padded `---` still closes frontmatter
-  (intentional, loose close).
-- `id_with_md_extension_keeps_identity` — dotted ids (`notes.md`) keep list/get/key identity.
-- `overwrite_does_not_touch_updated` — the store never auto-stamps `updated`. Passes, but this
-  is an undocumented contract: callers must bump `updated` themselves. Worth documenting.
-
----
-
-## Recommended priority order
-
-1. **HIGH-1** — make `manifest()` resilient (skip + warn). Breaks the central invariant.
-2. **HIGH-2** — validate `namespace` (traversal / data integrity).
-3. **MED-1** — decide case/Unicode collision policy *before* S3 lands (cross-backend divergence).
-4. **MED-2/3/4** — allowlist `validate_id`; sanitize `description` in `to_index_md`; flatten +
-   preserve unknown frontmatter.
-5. **LOW** — document or fix body whitespace/CRLF fidelity (or explicitly declare bodies are
-   normalized).
+1. **MED-6** — unify the two id-resolution paths so `list()` never reports an unreachable id.
+   This is the one that will bite the S3 backend.
+2. **MED-5** — guard `extra` against reserved-key shadowing so `to_markdown` can't emit
+   unparseable YAML.
+3. Document the derived-file (`manifest.json`/`index.md`) staleness window under concurrent
+   writers, and the "store never stamps `updated`" contract (pinned by
+   `overwrite_does_not_touch_updated`).

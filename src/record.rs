@@ -87,6 +87,19 @@ impl RecordMeta {
     }
 }
 
+/// The frontmatter keys backed by named [`RecordMeta`] fields (`kind` serializes as `type`).
+/// `extra` must never duplicate these. Keep in sync with `RecordMeta`'s fields.
+const RESERVED_FRONTMATTER_KEYS: [&str; 8] = [
+    "id",
+    "type",
+    "description",
+    "tags",
+    "created",
+    "updated",
+    "source",
+    "links",
+];
+
 /// A complete OKF memory: frontmatter plus the markdown body holding the fact itself.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Record {
@@ -150,8 +163,24 @@ impl Record {
 
     /// Render back to the on-disk markdown form (`---` frontmatter, blank line, body).
     /// The body is emitted verbatim — [`parse`](Self::parse) is its exact inverse.
+    ///
+    /// Any `extra` key that shadows a named frontmatter field is dropped first: otherwise
+    /// `#[serde(flatten)]` would emit the key twice (e.g. two `id:` lines) and the result
+    /// wouldn't parse. The named field is authoritative.
     pub fn to_markdown(&self) -> Result<String> {
-        let yaml = serde_yaml::to_string(&self.meta)?; // ends with a newline
+        let yaml = if self
+            .meta
+            .extra
+            .keys()
+            .any(|k| RESERVED_FRONTMATTER_KEYS.contains(&k.as_str()))
+        {
+            let mut meta = self.meta.clone();
+            meta.extra
+                .retain(|k, _| !RESERVED_FRONTMATTER_KEYS.contains(&k.as_str()));
+            serde_yaml::to_string(&meta)?
+        } else {
+            serde_yaml::to_string(&self.meta)? // ends with a newline
+        };
         Ok(format!("---\n{yaml}---\n\n{}\n", self.body))
     }
 }

@@ -219,3 +219,203 @@ fn overwrite_does_not_touch_updated() {
     // This passes — it just pins the behavior: the store never auto-stamps `updated`.
     assert_eq!(got.meta.updated, "2020-01-01T00:00:00Z");
 }
+
+// ===========================================================================
+// EXPANDED SCENARIOS (round 2) — probing the surface the fix introduced:
+// encode_id, RecordMeta.extra, namespace normalization, byte-faithful parse,
+// plus areas not covered before (store-level round-trips, divergence,
+// concurrency, resource limits).
+// ===========================================================================
+
+// --- New seam: extra (#[serde(flatten)]) collisions ------------------------
+
+/// ASSUMPTION: `parse(to_markdown(r))` is total — any constructible Record round-trips
+/// (the "lossless / byte-faithful" promise). Probe: an `extra` key that SHADOWS a known
+/// field. serde flatten emits a duplicate YAML key, and the output is then unparseable.
+#[test]
+fn extra_shadowing_known_field_round_trips() {
+    let mut m = meta("real-id");
+    m.extra
+        .insert("id".into(), serde_yaml::Value::String("ghost".into()));
+    let r = Record::new(m, "b");
+    let md = r.to_markdown().unwrap();
+    let back = Record::parse(&md);
+    assert!(
+        back.is_ok(),
+        "to_markdown emitted a duplicate `id:` key that parse rejects: {back:?}"
+    );
+}
+
+/// Store-level lossless check for NON-shadowing extra: a hand-added field survives a
+/// full put -> get cycle (not just the in-memory format round-trip).
+#[test]
+fn store_preserves_extra_through_put_get() {
+    let root = temp_bundle("extra-store");
+    let store = LocalStore::new(&root, "ns");
+    let mut m = meta("x");
+    m.extra.insert(
+        "importance".into(),
+        serde_yaml::Value::String("high".into()),
+    );
+    store.put(&Record::new(m, "b")).unwrap();
+    let got = store.get("x").unwrap();
+    std::fs::remove_dir_all(&root).ok();
+    assert_eq!(
+        got.meta.extra.get("importance"),
+        Some(&serde_yaml::Value::String("high".into())),
+        "extra frontmatter lost through the store"
+    );
+}
+
+// --- New seam: filename (encode_id) vs frontmatter id ----------------------
+
+/// ASSUMPTION: every record that `list()`/`manifest()` reports can be `get()` and
+/// `delete()`. Probe: a file whose frontmatter id differs from its on-disk stem (a
+/// rename, hand-edit, or any backend that keys files differently). list() trusts the
+/// frontmatter; get()/delete() recompute the filename via encode_id — they disagree, so
+/// the record is visible but unreachable.
+#[test]
+fn divergent_record_is_reachable_via_get() {
+    let root = temp_bundle("divergence");
+    let store = LocalStore::new(&root, "ns");
+    let f = store.bundle_dir().join("memories");
+    std::fs::create_dir_all(&f).unwrap();
+    let body = "---\nid: frontmatter-id\ntype: semantic\ndescription: d\ncreated: 2026-01-01T00:00:00Z\nupdated: 2026-01-01T00:00:00Z\n---\n\nb\n";
+    std::fs::write(f.join("on-disk-name.md"), body).unwrap();
+
+    let listed = store.list().unwrap();
+    let gettable = store.get("frontmatter-id").is_ok();
+    std::fs::remove_dir_all(&root).ok();
+    assert!(
+        listed.contains(&"frontmatter-id".to_string()) && gettable,
+        "record is listed as `frontmatter-id` but get() can't reach it (listed={listed:?})"
+    );
+}
+
+// --- encode_id injectivity / robustness ------------------------------------
+
+/// The `%` escape char must not be a legal id, or encode_id stops being injective
+/// (encode("Alpha") == "%41lpha" could collide with a literal id "%41lpha").
+#[test]
+fn percent_id_is_rejected() {
+    let root = temp_bundle("percent");
+    let store = LocalStore::new(&root, "ns");
+    let err = store.put(&Record::new(meta("%41lpha"), "b")).is_err();
+    std::fs::remove_dir_all(&root).ok();
+    assert!(
+        err,
+        "id containing `%` must be rejected to keep encode_id injective"
+    );
+}
+
+/// Strengthen the case-collision probe: not just two files, but both CONTENTS retrievable.
+#[test]
+fn case_distinct_ids_keep_distinct_content() {
+    let root = temp_bundle("case-content");
+    let store = LocalStore::new(&root, "ns");
+    store
+        .put(&Record::new(meta("Alpha"), "UPPER body"))
+        .unwrap();
+    store
+        .put(&Record::new(meta("alpha"), "lower body"))
+        .unwrap();
+    let upper = store.get("Alpha").unwrap().body;
+    let lower = store.get("alpha").unwrap().body;
+    std::fs::remove_dir_all(&root).ok();
+    assert_eq!(upper, "UPPER body");
+    assert_eq!(lower, "lower body");
+}
+
+// --- Body byte-fidelity edge cases (the new split_inclusive parser) --------
+
+fn body_round_trips(body: &str) -> bool {
+    let r = Record::new(meta("x"), body);
+    Record::parse(&r.to_markdown().unwrap()).unwrap().body == body
+}
+
+#[test]
+fn empty_body_round_trips() {
+    assert!(body_round_trips(""));
+}
+
+#[test]
+fn leading_blank_line_body_round_trips() {
+    assert!(body_round_trips("\nstarts after a blank line"));
+}
+
+#[test]
+fn trailing_newlines_body_round_trips() {
+    // A single trailing \n is the format separator; extra ones are content.
+    assert!(body_round_trips("text\n\n"));
+}
+
+#[test]
+fn body_round_trips_through_store() {
+    let root = temp_bundle("body-store");
+    let store = LocalStore::new(&root, "ns");
+    let body = "  indented\r\nCRLF line\n\ttab\n";
+    store.put(&Record::new(meta("x"), body)).unwrap();
+    let got = store.get("x").unwrap().body;
+    std::fs::remove_dir_all(&root).ok();
+    assert_eq!(got, body, "store round-trip mangled an exotic body");
+}
+
+// --- Namespace normalization behavior --------------------------------------
+
+/// Empty / dot-only namespaces collapse into the root. Pin the behavior and confirm it
+/// stays contained (no escape, no panic).
+#[test]
+fn empty_namespace_stays_in_root() {
+    let root = temp_bundle("ns-empty");
+    let store = LocalStore::new(&root, "");
+    assert_eq!(store.bundle_dir(), root);
+    let nested = LocalStore::new(&root, "../../a/b");
+    assert!(
+        nested.bundle_dir().starts_with(&root),
+        "namespace escaped root"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// --- Concurrency: many writers, no lost or corrupt records -----------------
+
+/// ASSUMPTION: concurrent writers don't lose records. Each put writes its own file then
+/// rebuilds the index; the API rebuilds from records (not the cached manifest.json), so
+/// every committed record must be visible afterward.
+#[test]
+fn concurrent_puts_are_all_visible() {
+    let root = temp_bundle("concurrency");
+    let store = LocalStore::new(&root, "ns");
+    std::thread::scope(|s| {
+        for i in 0..32 {
+            let store = &store;
+            s.spawn(move || {
+                let id = format!("id-{i:03}");
+                store
+                    .put(&Record::new(meta(&id), format!("body {i}")))
+                    .unwrap();
+            });
+        }
+    });
+    let ids = store.list().unwrap();
+    std::fs::remove_dir_all(&root).ok();
+    assert_eq!(ids.len(), 32, "concurrent puts lost records: {ids:?}");
+}
+
+// --- Resource limits: pathological id ---------------------------------------
+
+/// An over-long id must fail gracefully (an Err), never panic, and never silently
+/// truncate to collide with a different id.
+#[test]
+fn overlong_id_fails_gracefully() {
+    let root = temp_bundle("longid");
+    let store = LocalStore::new(&root, "ns");
+    let id = "a".repeat(5000);
+    let res = std::panic::catch_unwind(|| store.put(&Record::new(meta(&id), "b")));
+    std::fs::remove_dir_all(&root).ok();
+    match res {
+        Ok(Ok(())) => { /* FS accepted it — acceptable */ }
+        Ok(Err(_)) => { /* graceful error — acceptable */ }
+        Err(_) => panic!("over-long id PANICKED instead of erroring"),
+    }
+}
