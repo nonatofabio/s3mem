@@ -24,20 +24,13 @@ It combines two existing ideas:
 Requires a Rust toolchain.
 
 ```bash
-# CLI with both backends:
-cargo build --release --features cli,s3
+cargo build --release --features cli
 export PATH="$PWD/target/release:$PATH"
 ```
 
-Feature flags:
-
-| Feature   | Pulls in            | Gives you                                              |
-|-----------|---------------------|-------------------------------------------------------|
-| *(none)*  | —                   | format layer, local-FS backend, recall (BM25 + grep)  |
-| `s3`      | AWS SDK + Tokio     | the S3 backend (`S3Store`)                             |
-| `cli`     | clap                | the `s3mem` binary                                     |
-
-The core crate is dependency-light and **AWS-free by default** — `s3` and `cli` are opt-in.
+Both backends (local filesystem and S3) are always built in. The one feature flag is `cli`
+(pulls in clap to build the `s3mem` binary) — library users who only want the API can leave
+it off.
 
 ## Quickstart (CLI)
 
@@ -83,8 +76,8 @@ for hit in bm25(&records, "how does the user ship code", &Filter::default(), 5) 
 }
 ```
 
-Swap `LocalStore` for `S3Store::new("my-bucket", "my-agent")?` (with `--features s3`) and
-nothing else changes — both implement the same `Store` trait.
+Swap `LocalStore` for `S3Store::new("my-bucket", "my-agent")?` and nothing else changes —
+both implement the same `Store` trait.
 
 ## The data model
 
@@ -136,6 +129,22 @@ size/mtime locally, object ETag on S3), so it's rebuilt automatically when the b
 changes, including out-of-band edits. The cache is transparent — results are identical to the
 uncached path.
 
+## Linking memories
+
+Memories form a graph. `link` records a **mutual** edge in frontmatter; you can also write
+`[[other-id]]` wiki-links in a body (directional, the OKF convention). `neighbors` walks the
+graph so an agent can pull a connected cluster of context at once.
+
+```bash
+s3mem link user-deploy-pref ci-pipeline      # mutual edge
+s3mem links user-deploy-pref                 # direct neighbors
+s3mem neighbors user-deploy-pref --depth 2   # everything within 2 hops
+s3mem unlink user-deploy-pref ci-pipeline
+```
+
+Traversal tolerates dangling links (a `[[id]]` with no record shows as `exists: false`), so
+the graph never breaks when a memory is forgotten.
+
 ## For agents: the skill
 
 [`skills/s3mem-memory/SKILL.md`](skills/s3mem-memory/SKILL.md) wraps the CLI as an agent
@@ -169,10 +178,10 @@ invariants worth preserving.
 - **S3 Select prefilter** — the cached index makes recall a single fetch, but for very large
   S3 bundles even that one object grows; pushing the `type`/`tag` prefilter down to S3 Select
   would avoid fetching the whole index.
-- **Graph edges** — the `links` field exists in the format; `link`/`export` tooling to walk
-  and ship the graph does not yet.
 - **Optional vector recall** — an embedding-ranked stage layered on BM25, kept optional so it
   never becomes a hard dependency that breaks portability.
+- **Referential cleanup** — `forget` currently leaves dangling links (traversal tolerates
+  them); a `gc`/prune pass to drop edges to deleted records is a nice-to-have.
 
 ## License
 

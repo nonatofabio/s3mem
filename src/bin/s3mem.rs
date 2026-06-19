@@ -93,6 +93,25 @@ enum Command {
     },
     /// Delete a memory by id.
     Forget { id: String },
+    /// Create a mutual link between two memories.
+    Link { a: String, b: String },
+    /// Remove the mutual link between two memories.
+    Unlink { a: String, b: String },
+    /// Show a memory's direct links (frontmatter `links` + body `[[id]]`).
+    Links {
+        id: String,
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Traverse the link graph outward from a memory.
+    Neighbors {
+        id: String,
+        /// How many hops to follow.
+        #[arg(long, default_value_t = 2)]
+        depth: usize,
+        #[arg(long)]
+        pretty: bool,
+    },
 }
 
 type CliResult = Result<(), Box<dyn std::error::Error>>;
@@ -171,13 +190,37 @@ fn run() -> CliResult {
             store.delete(&id)?;
             eprintln!("forgot `{id}`");
         }
+        Command::Link { a, b } => {
+            s3mem::link(store.as_ref(), &a, &b)?;
+            eprintln!("linked `{a}` <-> `{b}`");
+        }
+        Command::Unlink { a, b } => {
+            s3mem::unlink(store.as_ref(), &a, &b)?;
+            eprintln!("unlinked `{a}` <-> `{b}`");
+        }
+        Command::Links { id, pretty } => {
+            store.get(&id)?; // validate the memory exists
+            let records = store.records()?;
+            let direct = s3mem::neighbors(&records, &id, 1);
+            print_neighbors(&direct, pretty)?;
+        }
+        Command::Neighbors { id, depth, pretty } => {
+            store.get(&id)?;
+            let records = store.records()?;
+            let reached = s3mem::neighbors(&records, &id, depth);
+            print_neighbors(&reached, pretty)?;
+        }
     }
     Ok(())
 }
 
 fn open_store(cli: &Cli) -> Result<Box<dyn Store>, Box<dyn std::error::Error>> {
     if let Some(bucket) = &cli.bucket {
-        return open_s3(cli, bucket);
+        return Ok(Box::new(s3mem::S3Store::with_prefix(
+            bucket.clone(),
+            cli.prefix.clone(),
+            cli.namespace.clone(),
+        )?));
     }
     if let Some(path) = &cli.path {
         return Ok(Box::new(LocalStore::new(
@@ -188,18 +231,23 @@ fn open_store(cli: &Cli) -> Result<Box<dyn Store>, Box<dyn std::error::Error>> {
     Err("no backend selected: set --path/$S3MEM_PATH (local) or --bucket/$S3MEM_BUCKET (s3)".into())
 }
 
-#[cfg(feature = "s3")]
-fn open_s3(cli: &Cli, bucket: &str) -> Result<Box<dyn Store>, Box<dyn std::error::Error>> {
-    Ok(Box::new(s3mem::S3Store::with_prefix(
-        bucket.to_string(),
-        cli.prefix.clone(),
-        cli.namespace.clone(),
-    )?))
-}
-
-#[cfg(not(feature = "s3"))]
-fn open_s3(_cli: &Cli, _bucket: &str) -> Result<Box<dyn Store>, Box<dyn std::error::Error>> {
-    Err("--bucket needs the `s3` feature; rebuild with `--features cli,s3`, or use --path".into())
+fn print_neighbors(neighbors: &[s3mem::Neighbor], pretty: bool) -> CliResult {
+    if !pretty {
+        println!("{}", serde_json::to_string_pretty(neighbors)?);
+        return Ok(());
+    }
+    if neighbors.is_empty() {
+        println!("(no links)");
+        return Ok(());
+    }
+    for n in neighbors {
+        let desc = match &n.description {
+            Some(d) => d.as_str(),
+            None => "(missing)",
+        };
+        println!("● {} (depth {}) — {desc}", n.id, n.depth);
+    }
+    Ok(())
 }
 
 fn print_hits(hits: &[s3mem::Hit], pretty: bool) -> CliResult {

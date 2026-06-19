@@ -37,15 +37,16 @@
 
 pub mod backend;
 pub mod error;
+pub mod graph;
 pub mod recall;
 pub mod record;
 pub mod store;
 mod util;
 
 pub use backend::local::LocalStore;
-#[cfg(feature = "s3")]
 pub use backend::s3::S3Store;
 pub use error::{Error, Result};
+pub use graph::{edges, link, neighbors, unlink, wikilinks, Neighbor};
 pub use recall::{bm25, grep, load_or_build_index, Filter, GrepOptions, Hit, Index};
 pub use record::{MemoryType, Record, RecordMeta};
 pub use store::{Manifest, ManifestEntry, Store};

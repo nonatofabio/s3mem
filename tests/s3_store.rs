@@ -2,9 +2,8 @@
 //! available), so the suite stays green offline. Run against a real/LocalStack bucket with:
 //!
 //! ```bash
-//! S3MEM_TEST_BUCKET=my-bucket cargo test --features s3 --test s3_store -- --nocapture
+//! S3MEM_TEST_BUCKET=my-bucket cargo test --test s3_store -- --nocapture
 //! ```
-#![cfg(feature = "s3")]
 
 use s3mem::{MemoryType, Record, RecordMeta, S3Store, Store};
 

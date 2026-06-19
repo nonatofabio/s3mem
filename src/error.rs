@@ -32,6 +32,10 @@ pub enum Error {
     /// An invalid `grep` search pattern (bad regex).
     #[error("invalid search pattern: {0}")]
     Pattern(String),
+
+    /// An invalid graph operation (e.g. linking a record to itself).
+    #[error("{0}")]
+    Graph(String),
 }
 
 impl Error {

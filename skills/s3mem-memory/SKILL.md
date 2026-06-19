@@ -74,6 +74,23 @@ s3mem forget <id>          # delete a memory
 `--id` must be a stable slug (`[A-Za-z0-9._-]`, no `.`/`..`). Re-`remember`ing the same id
 overwrites it; bump your own `updated` understanding — the store does not auto-stamp it.
 
+## Linking related memories
+
+Memories form a graph. When two facts relate, link them — then you can pull a whole cluster
+of context in one step instead of recalling each piece separately.
+
+```bash
+s3mem link user-deploy-pref ci-pipeline      # mutual edge between two memories
+s3mem links user-deploy-pref                 # this memory's direct neighbors
+s3mem neighbors user-deploy-pref --depth 2   # everything reachable within 2 hops
+s3mem unlink user-deploy-pref ci-pipeline    # remove the edge
+```
+
+`link` is bidirectional and idempotent. You can also write `[[other-id]]` inside a memory's
+body; those count as (directional) edges too. `neighbors` tolerates dangling links — a target
+with no memory shows `exists: false` rather than erroring. Use `neighbors` after a `recall`
+hit to expand outward into related context.
+
 ## When to reach for this skill
 
 - **Before answering from assumptions about the user/project** — `recall` first; the memory may

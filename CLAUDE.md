@@ -4,30 +4,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status: working core (Rust, early)
 
-The crate ships the **format layer** ([`Record`]), the **local-filesystem backend**
-([`LocalStore`]), the **S3 backend** ([`S3Store`], behind the `s3` feature) — both behind the
-same [`Store`] trait — the **recall layer** (BM25 + grep, with a fingerprint-gated cached
-index), the **`s3mem` CLI** (`cli` feature), and an agent **skill** (`skills/s3mem-memory/`).
-The architecture section is the design of record — build outward from here and keep this file
-current as tooling lands.
+The crate ships the **format layer** ([`Record`]), the **local-filesystem and S3 backends**
+([`LocalStore`] / [`S3Store`], both always compiled, behind the same [`Store`] trait), the
+**recall layer** (BM25 + grep, with a fingerprint-gated cached index), the **link graph**
+(`graph.rs`), the **`s3mem` CLI** (`cli` feature), and an agent **skill**
+(`skills/s3mem-memory/`). The architecture section is the design of record — build outward
+from here and keep this file current as tooling lands.
 
 ### Commands
 
+Both backends are always compiled (S3 is no longer feature-gated), so plain `cargo test`
+builds the AWS SDK. The only feature is `cli` (clap, for the binary).
+
 ```bash
-cargo test               # core suite (unit + integration + doctests), no AWS deps
-cargo test --features s3                  # also builds S3 backend + its key tests
-cargo build --features cli                # build the `s3mem` CLI (local backend only)
-cargo build --release --features cli,s3   # build the CLI with S3 support (for the skill)
+cargo test                                # full suite (both backends always built in)
+cargo build --release --features cli      # build the `s3mem` CLI
 cargo test --test recall                  # recall integration tests over a LocalStore
 cargo test round_trips_through_markdown   # a single test by name
-cargo clippy --all-targets --features cli,s3   # lints (kept clean across feature sets)
+cargo clippy --all-targets --features cli # lints (kept clean)
 cargo fmt                                 # format (rustfmt)
 
 # Live S3 round-trip (skipped unless a bucket + AWS creds are present):
-S3MEM_TEST_BUCKET=my-bucket cargo test --features s3 --test s3_store -- --nocapture
+S3MEM_TEST_BUCKET=my-bucket cargo test --test s3_store -- --nocapture
 
 # Drive the CLI:
-S3MEM_PATH=/tmp/mem S3MEM_NAMESPACE=agent target/debug/s3mem recall "rust deploy" --pretty
+S3MEM_PATH=/tmp/mem S3MEM_NAMESPACE=agent target/debug/s3mem neighbors my-id --depth 2
 ```
 
 ### Source layout
@@ -37,6 +38,7 @@ src/
   lib.rs            crate root + re-exports + doctest of the happy path
   record.rs         OKF Record / RecordMeta / MemoryType — parse + to_markdown
   store.rs          Store trait (incl. records()) + Manifest/ManifestEntry
+  graph.rs          link/unlink (mutual edges) + neighbors BFS + [[id]] wikilinks
   error.rs          Error enum (thiserror), Result alias
   util.rs           now_iso() RFC-3339 timestamp helper
   recall/
@@ -52,13 +54,15 @@ src/
     local.rs        LocalStore — Store over a directory
     s3.rs           S3Store — Store over S3 objects (feature = "s3")
   bin/s3mem.rs      the `s3mem` CLI (feature = "cli"): remember/recall/grep/get/list/forget
+                    + link/unlink/links/neighbors
 skills/s3mem-memory/SKILL.md   agent skill wrapping the CLI (when to use recall vs grep)
 tests/local_store.rs  integration tests against a temp-dir bundle
 tests/qa_probes.rs    adversarial corner-case suite (see QA_FINDINGS.md)
 tests/recall_probes.rs  adversarial recall-layer probes (see QA_FINDINGS.md)
 tests/recall.rs       recall over a real LocalStore corpus
 tests/cache.rs        cached-index lifecycle (write/reuse/self-heal/transparency)
-tests/s3_store.rs     live S3 round-trip, gated on S3MEM_TEST_BUCKET (feature = "s3")
+tests/graph.rs        link/unlink/neighbors over a real LocalStore
+tests/s3_store.rs     live S3 round-trip, gated on S3MEM_TEST_BUCKET
 ```
 
 Key implementation notes for future work:
@@ -91,8 +95,13 @@ Key implementation notes for future work:
 - `get`/`delete` resolve a record by its **frontmatter id**: a fast path at the canonical
   `encode_id(id)` key, then a fallback scan for files/objects whose on-disk name diverges
   (renames, hand-edits). Keep `get`/`delete` consistent with what `list`/`manifest` report.
-- The S3 backend is **off by default** to keep the core crate AWS-free; gate any future
-  AWS-only code behind `#[cfg(feature = "s3")]`.
+- **Both backends are always compiled** (S3 is not feature-gated; the AWS SDK is a normal
+  dependency). The only feature is `cli`.
+- **The graph layer (`graph.rs`) sits beside recall, over `Store`.** `neighbors`/`edges`/
+  `wikilinks` are pure over `&[Record]`; `link`/`unlink` read-modify-write through `Store` and
+  bump `updated` (the right place for the auto-stamp the store itself omits). Edges are the
+  union of frontmatter `links` (mutual) and body `[[id]]` (directional); traversal tolerates
+  dangling targets. Mutations touch only `links`, never the body prose.
 - `manifest.json` + `index.md` are **derived on every write** (`LocalStore::reindex`) and
   are never authoritative. `manifest()`/`list()` go through `read_entries`, which **skips +
   warns on unparseable files** rather than failing the whole bundle — a stray non-OKF `.md`
@@ -122,8 +131,8 @@ Concept, pitch, and the OKF/s3grep lineage live in the [README](README.md). This
 implemented shape — five layers, each independent of the ones above it:
 
 ```
-Skill / CLI ──  s3mem remember · recall · grep · get · list · forget   (bin/s3mem.rs, skills/)
-Recall ──────  bm25() / Index ranked + grep(), cached in recall-index.json     (recall/)
+Skill / CLI ──  s3mem remember·recall·grep·get·list·forget·link·neighbors  (bin/s3mem.rs, skills/)
+Recall + graph  bm25()/Index + grep() (recall-index.json) · link/neighbors  (recall/, graph.rs)
 Store ───────  put/get/list/delete/manifest/records/fingerprint/artifact       (backend/)
 Index ───────  manifest.json + index.md (write) · recall-index.json (lazy, fingerprint-gated)
 Format (OKF) ─ Record: frontmatter + body; parse ⇄ to_markdown                 (record.rs)
@@ -142,9 +151,9 @@ editing a backend or the format.
 - **S3 Select prefilter.** The cached index makes recall a single fetch, but a very large
   bundle's index object itself grows; pushing the `type`/`tag` prefilter down to S3 Select
   would avoid fetching the whole index.
-- **Graph edges.** The `links` field exists in the format but nothing walks or ships the graph
-  yet (no `link`/`export` tooling).
 - **Optional vector recall.** An embedding-ranked stage layered on BM25 — keep it optional; a
   hard embedding dependency would break the portability guarantee.
 - **CJK recall** is unigram+bigram (`recall/tokenize.rs`); a proper Unicode word segmenter
   would improve precision if non-Latin memory becomes common.
+- **Referential cleanup.** `delete`/`forget` leaves dangling `links` in other records
+  (traversal tolerates them); a prune/`gc` pass is a nice-to-have.
