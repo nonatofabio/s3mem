@@ -72,12 +72,25 @@ impl Manifest {
         let mut sorted = self.entries.clone();
         sorted.sort_by(|a, b| a.id.cmp(&b.id));
         for e in &sorted {
+            // Collapse control characters so a newline in `description` can't break out of
+            // its list row and splice a raw line into the generated markdown.
             out.push_str(&format!(
                 "- [`{}`]({}) — {} _({})_\n",
-                e.id, e.key, e.description, e.kind
+                one_line(&e.id),
+                e.key,
+                one_line(&e.description),
+                e.kind
             ));
         }
         out.push_str(&format!("\n{} memories.\n", sorted.len()));
         out
     }
+}
+
+/// Replace control characters (newlines, tabs, …) with spaces so a value renders on a
+/// single markdown line.
+fn one_line(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }

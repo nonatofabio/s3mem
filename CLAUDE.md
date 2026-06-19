@@ -38,9 +38,26 @@ Key implementation notes for future work:
 - `Store` is the seam. The S3 backend is a new sibling under `backend/` implementing the
   same trait — callers don't change. Keep S3-only concerns out of `store.rs`.
 - `manifest.json` + `index.md` are **derived on every write** (`LocalStore::reindex`) and
-  are never authoritative — `manifest()` rebuilds them by reading the records.
-- Record ids are filenames, so `validate_id` rejects path traversal — preserve that in any
+  are never authoritative. `manifest()`/`list()` go through `read_entries`, which **skips +
+  warns on unparseable files** rather than failing the whole bundle — a stray non-OKF `.md`
+  must never brick writes. Ids come from each record's frontmatter, not the filename.
+- **Two safety boundaries, symmetric:** record ids go through `validate_id` (allowlist:
+  `[A-Za-z0-9._-]`, never `.`/`..`), and the `namespace` is contained by `bundle_dir`
+  (traversal components dropped) so neither can escape the bundle root. Preserve both in any
   new backend.
+- **On-disk filenames are `encode_id(id)`** (uppercase letters percent-escaped to lowercase
+  hex), so case-only-distinct ids (`Alpha` vs `alpha`) don't collide on case-insensitive
+  filesystems — the "ship a bundle around unchanged" claim must hold across backends. S3 is
+  case-sensitive, so apply the same encoding there for cross-backend parity.
+- **Format round-trip is byte-faithful:** `Record::parse` is the exact inverse of
+  `to_markdown` (leading whitespace, CRLF, and unknown frontmatter fields all preserved).
+  Unknown frontmatter is captured in `RecordMeta.extra` (`#[serde(flatten)]`) so hand-edits
+  aren't silently dropped. Don't reintroduce body trimming or `.lines()`-based body parsing.
+- **The store never stamps `updated`** — callers must bump it themselves before `put`. If a
+  higher-level `remember()` API lands, that's where the auto-stamp belongs.
+
+See [`QA_FINDINGS.md`](QA_FINDINGS.md) and [`tests/qa_probes.rs`](tests/qa_probes.rs) for the
+corner cases these invariants defend (all 13 probes now pass).
 
 ## The idea (from README)
 

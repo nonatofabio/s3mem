@@ -1,5 +1,7 @@
 //! The OKF format layer: one memory == one markdown file with YAML frontmatter.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -33,7 +35,10 @@ impl std::fmt::Display for MemoryType {
 ///
 /// Field order here is the on-disk order (serde preserves struct order), chosen so a
 /// hand-read file leads with identity and description.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Eq`: `extra` holds arbitrary YAML, which may contain floats, so only `PartialEq`
+/// is available.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RecordMeta {
     /// Stable kebab-slug; also the object key stem (`memories/<id>.md`).
     pub id: String,
@@ -52,6 +57,10 @@ pub struct RecordMeta {
     /// Graph edges: ids of related records (mirror as `[[id]]` in the body).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<String>,
+    /// Any other frontmatter keys a human or tool added, preserved verbatim so hand-edits
+    /// are lossless (OKF's "git-native, hand-editable" promise). Serialized inline.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_yaml::Value>,
 }
 
 impl RecordMeta {
@@ -73,12 +82,13 @@ impl RecordMeta {
             updated: ts,
             source: None,
             links: Vec::new(),
+            extra: BTreeMap::new(),
         }
     }
 }
 
 /// A complete OKF memory: frontmatter plus the markdown body holding the fact itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Record {
     pub meta: RecordMeta,
     pub body: String,
@@ -93,38 +103,56 @@ impl Record {
     }
 
     /// Parse a `---`-delimited frontmatter document into a [`Record`].
+    ///
+    /// The body is recovered byte-for-byte (leading whitespace and CRLF preserved) so that
+    /// `parse(to_markdown(r)) == r`: we scan the frontmatter line-by-line (allowing a
+    /// whitespace-padded closing `---`) while tracking the byte offset, then slice the body
+    /// out of the raw input rather than re-joining lines.
     pub fn parse(input: &str) -> Result<Self> {
         // Tolerate a UTF-8 BOM.
         let input = input.strip_prefix('\u{feff}').unwrap_or(input);
 
-        let mut lines = input.lines();
-        if lines.next().map(str::trim) != Some("---") {
+        // `split_inclusive` keeps each line's trailing `\n`, so byte lengths sum exactly to
+        // the offset where the body begins.
+        let mut segments = input.split_inclusive('\n');
+        let mut consumed = 0usize;
+
+        let first = segments.next().ok_or(Error::MissingFrontmatter)?;
+        consumed += first.len();
+        if first.trim() != "---" {
             return Err(Error::MissingFrontmatter);
         }
 
         let mut yaml = String::new();
         let mut closed = false;
-        for line in lines.by_ref() {
-            if line.trim() == "---" {
+        for seg in segments {
+            consumed += seg.len();
+            if seg.trim() == "---" {
                 closed = true;
                 break;
             }
-            yaml.push_str(line);
-            yaml.push('\n');
+            yaml.push_str(seg);
         }
         if !closed {
             return Err(Error::MissingFrontmatter);
         }
 
         let meta: RecordMeta = serde_yaml::from_str(&yaml)?;
-        let body = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+
+        // Everything after the closing delimiter is the body, minus the single blank-line
+        // separator and single trailing newline that `to_markdown` adds.
+        let rest = &input[consumed..];
+        let rest = rest.strip_prefix('\n').unwrap_or(rest);
+        let body = rest.strip_suffix('\n').unwrap_or(rest).to_string();
+
         Ok(Record { meta, body })
     }
 
     /// Render back to the on-disk markdown form (`---` frontmatter, blank line, body).
+    /// The body is emitted verbatim — [`parse`](Self::parse) is its exact inverse.
     pub fn to_markdown(&self) -> Result<String> {
         let yaml = serde_yaml::to_string(&self.meta)?; // ends with a newline
-        Ok(format!("---\n{yaml}---\n\n{}\n", self.body.trim_end()))
+        Ok(format!("---\n{yaml}---\n\n{}\n", self.body))
     }
 }
 

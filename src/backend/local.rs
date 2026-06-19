@@ -33,8 +33,19 @@ impl LocalStore {
     }
 
     /// The bundle root, `<root>/<namespace>/`.
+    ///
+    /// The namespace is split on path separators and any empty / `.` / `..` component is
+    /// dropped, so a hostile namespace like `../escape` is contained inside `root` rather
+    /// than escaping it (record ids get the same treatment via [`validate_id`]).
     pub fn bundle_dir(&self) -> PathBuf {
-        self.root.join(&self.namespace)
+        let mut dir = self.root.clone();
+        for part in self.namespace.split(['/', '\\']) {
+            if part.is_empty() || part == "." || part == ".." {
+                continue;
+            }
+            dir.push(part);
+        }
+        dir
     }
 
     fn memories_dir(&self) -> PathBuf {
@@ -42,7 +53,47 @@ impl LocalStore {
     }
 
     fn record_path(&self, id: &str) -> PathBuf {
-        self.memories_dir().join(format!("{id}.md"))
+        self.memories_dir().join(format!("{}.md", encode_id(id)))
+    }
+
+    /// Read every parseable record in the bundle (sorted by id), pairing each with its
+    /// bundle-relative key. Foreign or corrupt `.md` files are skipped with a warning
+    /// instead of failing the whole bundle, so the manifest stays reconstructable even
+    /// when a human drops a stray note into `memories/`.
+    fn read_entries(&self) -> Result<Vec<(String, Record)>> {
+        let dir = self.memories_dir();
+        let read_dir = match fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(Error::io(&dir, e)),
+        };
+
+        let mut out = Vec::new();
+        for entry in read_dir {
+            let entry = entry.map_err(|e| Error::io(&dir, e))?;
+            let path = entry.path();
+            if !is_markdown(&path) {
+                continue;
+            }
+            let text = fs::read_to_string(&path).map_err(|e| Error::io(&path, e))?;
+            match Record::parse(&text) {
+                Ok(record) => {
+                    let file_name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default();
+                    out.push((format!("memories/{file_name}"), record));
+                }
+                Err(err) => {
+                    eprintln!(
+                        "s3mem: skipping unparseable memory file {}: {err}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        out.sort_by(|a, b| a.1.meta.id.cmp(&b.1.meta.id));
+        Ok(out)
     }
 
     /// Rebuild `manifest.json` and `index.md` from the records on disk.
@@ -61,17 +112,38 @@ impl LocalStore {
     }
 }
 
-/// Ids become filenames, so they must be a single, traversal-safe path segment.
+/// Ids become filenames, so they're held to an allowlist: ASCII alphanumerics plus
+/// `-`, `_`, `.` — and never the traversal tokens `.`/`..`. This rejects path separators,
+/// control characters (newlines), spaces and unicode up front, rather than denylisting a
+/// handful of known-bad characters.
 fn validate_id(id: &str) -> Result<()> {
-    let bad = id.is_empty()
-        || id.contains('/')
-        || id.contains('\\')
-        || id.contains("..")
-        || id.contains(std::path::MAIN_SEPARATOR);
+    let allowed = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.');
+    let bad =
+        id.is_empty() || id == "." || id == ".." || id.contains("..") || !id.bytes().all(allowed);
     if bad {
         return Err(Error::InvalidId(id.to_string()));
     }
     Ok(())
+}
+
+/// Encode an (already validated) id into a case-insensitive-collision-free filename stem.
+///
+/// Uppercase ASCII letters are percent-escaped with lowercase hex, so every filename is
+/// all-lowercase and the encoding is injective. Two ids that differ only by case (`Alpha`
+/// vs `alpha`) therefore map to distinct filenames that don't collapse on a
+/// case-insensitive filesystem (macOS APFS, Windows NTFS) — preserving the "ship a bundle
+/// around unchanged" invariant across backends.
+fn encode_id(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    for b in id.bytes() {
+        if b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{b:02x}"));
+        }
+    }
+    out
 }
 
 impl Store for LocalStore {
@@ -101,25 +173,13 @@ impl Store for LocalStore {
     }
 
     fn list(&self) -> Result<Vec<String>> {
-        let dir = self.memories_dir();
-        let entries = match fs::read_dir(&dir) {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(Error::io(&dir, e)),
-        };
-
-        let mut ids = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|e| Error::io(&dir, e))?;
-            let path = entry.path();
-            if is_markdown(&path) {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    ids.push(stem.to_string());
-                }
-            }
-        }
-        ids.sort();
-        Ok(ids)
+        // Ids come from each record's frontmatter, not the (encoded) filename, so they read
+        // back exactly as written regardless of the on-disk encoding.
+        Ok(self
+            .read_entries()?
+            .into_iter()
+            .map(|(_, record)| record.meta.id)
+            .collect())
     }
 
     fn delete(&self, id: &str) -> Result<()> {
@@ -136,11 +196,15 @@ impl Store for LocalStore {
     }
 
     fn manifest(&self) -> Result<Manifest> {
-        let mut entries = Vec::new();
-        for id in self.list()? {
-            let record = self.get(&id)?;
-            entries.push(ManifestEntry::from_record(&record));
-        }
+        let entries = self
+            .read_entries()?
+            .into_iter()
+            .map(|(key, record)| {
+                let mut entry = ManifestEntry::from_record(&record);
+                entry.key = key; // the real (encoded) filename, not a guess from the id
+                entry
+            })
+            .collect();
         Ok(Manifest { entries })
     }
 }
