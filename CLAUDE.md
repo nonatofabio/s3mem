@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Status: early scaffold (Rust)
+## Status: working core (Rust, early)
 
 The crate ships the **format layer** ([`Record`]), the **local-filesystem backend**
 ([`LocalStore`]), the **S3 backend** ([`S3Store`], behind the `s3` feature) — both behind the
@@ -68,7 +68,6 @@ Key implementation notes for future work:
   step for very large S3 bundles (every `recall` currently does one GET per object).
 - The CLI prints **JSON by default** for the recall tools (agent-parseable), `--pretty` for
   humans. Backend/namespace come from `S3MEM_PATH`/`S3MEM_BUCKET`/`S3MEM_NAMESPACE` env vars.
-
 - `Store` is the seam, and it's **synchronous**. The AWS SDK is async, so `S3Store` owns a
   Tokio runtime and bridges each call with `block_on` — this keeps the trait, the local
   backend, and all callers sync. Don't asyncify the trait to accommodate S3.
@@ -101,115 +100,35 @@ Key implementation notes for future work:
   higher-level `remember()` API lands, that's where the auto-stamp belongs.
 
 See [`QA_FINDINGS.md`](QA_FINDINGS.md) and [`tests/qa_probes.rs`](tests/qa_probes.rs) for the
-corner cases these invariants defend (all 13 probes now pass).
+corner cases these invariants defend (all 25 probes pass).
 
-## The idea (from README)
+## Architecture (as built)
 
-**S3Mem = OKF memory over S3.** A portable, vendor-neutral memory store for agents, built
-by combining two existing ideas:
-
-- **OKF** ([Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf)) —
-  knowledge as plain **markdown + YAML frontmatter**, one concept per file, `index.md` for
-  navigation, markdown `[[links]]` as graph edges. Git-native, no SDK required to read.
-- **s3grep** ([dacort/s3grep](https://github.com/dacort/s3grep)) — fast **parallel, concurrent
-  search across S3 objects** (handles `.gz`, configurable concurrency).
-
-The pitch: an agent's memory is **just OKF files living under an S3 prefix**. Because each
-memory is a plain object, a whole memory can be **shipped around** — copied to another
-bucket, tarballed, or synced to a filesystem/git repo — with no database and no lock-in.
-
-## Architecture
-
-Five layers, each independently replaceable. The core invariant: **a memory is a file; a
-memory bundle is a prefix.** Nothing above the Store layer requires S3 specifically — swap
-in a local filesystem and everything still works (that's the portability claim).
+Concept, pitch, and the OKF/s3grep lineage live in the [README](README.md). This is the
+implemented shape — five layers, each independent of the ones above it:
 
 ```
-┌─ Agent interface ─┐  remember() · recall() · forget() · link() · export()/ship()
-├─ Search / recall ─┤  frontmatter filter (S3 Select) → parallel content grep → rank → top-k
-├─ Index ───────────┤  auto-generated index.md + manifest.json (frontmatter digest)
-├─ Store ───────────┤  S3 object layout (or local FS) — pluggable backend
-└─ Format (OKF) ────┘  markdown + YAML frontmatter, one memory per file
+Skill / CLI ──  s3mem remember · recall · grep · get · list · forget   (bin/s3mem.rs, skills/)
+Recall ──────  bm25() ranked  +  grep() literal/regex, over Store::records()   (recall/)
+Store ───────  put/get/list/delete/manifest/records — LocalStore | S3Store     (backend/)
+Index ───────  manifest.json + index.md, derived on every write (cache, not truth)
+Format (OKF) ─ Record: frontmatter + body; parse ⇄ to_markdown                 (record.rs)
 ```
 
-### 1. Format layer (OKF record)
-One memory = one markdown file. Frontmatter carries the structured, filterable fields; the
-body carries the fact and its relationships. Suggested schema:
+The core invariant — **a memory is a file; a bundle is a prefix**
+(`<root | s3://bucket>/<namespace>/`) — is what makes the portability claim real: everything
+above the Store layer is backend-agnostic, so a bundle is byte-for-byte identical on disk and
+on S3. Guard it — anything that can't survive a copy-to-filesystem (an embedded DB, a vendor
+API, a non-portable index) belongs in an optional layer, never the core. The "Key
+implementation notes" above are the specific invariants that protect this; read them before
+editing a backend or the format.
 
-```markdown
----
-id: <stable-kebab-slug>          # also the object key stem
-type: semantic | episodic | procedural | reference
-description: <one-line summary>   # used for cheap relevance ranking
-tags: [<topic>, ...]
-created: <ISO-8601>
-updated: <ISO-8601>
-source: <where it came from>
-links: [<other-id>, ...]          # graph edges, mirrored as [[id]] in body
----
+## Not yet built (roadmap)
 
-<the memory>. Relate to others with [[other-id]].
-```
-
-Keep frontmatter fields flat and stable — the Search layer filters on them via S3 Select,
-so adding/renaming required fields is a format-migration concern.
-
-### 2. Store layer (pluggable backend)
-Object layout — a **bundle** is everything under `<namespace>/`:
-
-```
-s3://<bucket>/<namespace>/
-  memories/<id>.md        # one OKF record per object
-  index.md                # human/agent-navigable, auto-generated
-  manifest.json           # machine index: id → {description, type, tags, updated, key}
-```
-
-`<namespace>` scopes a bundle (per-agent, per-project, per-user). The backend is an
-interface (`get`/`put`/`list`/`delete`/`select`) with at least an **S3** and a **local
-filesystem** implementation so bundles round-trip between cloud and disk unchanged.
-
-### 3. Index layer
-Avoid scanning every object on every recall. Maintain two derived artifacts, rebuilt on
-write (or lazily):
-- `manifest.json` — a compact digest of every record's frontmatter. Cheap to fetch whole;
-  lets recall pre-filter candidates before touching object bodies.
-- `index.md` — the OKF navigation entrypoint, regenerated from the manifest.
-
-The manifest is a **cache, never the source of truth** — it must be reconstructable by
-listing + reading the `memories/` objects.
-
-### 4. Search / recall layer
-Two-stage retrieval — this is where s3grep's idea lives:
-1. **Filter** by structured fields (type/tags/recency) using **S3 Select** over
-   `manifest.json`, or a manifest read on small bundles → candidate key set.
-2. **Content search** the candidate object bodies with s3grep-style **parallel concurrent
-   scanning** (regex/keyword). Rank by description match + recency + tag overlap, return
-   top-k **full OKF documents** for the agent to load into context.
-
-Start with lexical search (grep). Vector/embedding recall is a later, optional ranking
-stage layered on top — don't let it become a hard dependency, it breaks portability.
-
-### 5. Agent interface layer
-The surface agents actually call. Each verb maps to layers below:
-- `remember(fact, meta)` → write OKF record (Format) → PUT (Store) → update index (Index)
-- `recall(query, filters, k)` → two-stage retrieval (Search) → top-k records
-- `forget(id)` → delete object + reindex
-- `link(a, b)` → add edge to both records' frontmatter + body
-- `export(namespace)` / `ship(src, dst)` → copy/sync a prefix to another backend or tarball
-
-### "Shipped around" — the whole point
-Because a bundle is a self-contained prefix of plain files: `ship` is `aws s3 sync`,
-`s3 cp --recursive`, a `.tar.gz`, or a git push. No export format to design, no DB to dump.
-A shipped bundle is readable by humans, by Obsidian/MkDocs, and by any other agent — that
-portability is the product, so guard it: any feature that can't survive a copy-to-filesystem
-(proprietary index, embedded DB, vendor API) belongs in an optional layer, never the core.
-
-## When building this out
-
-- **Language is unchosen.** s3grep is Rust; if recall throughput matters, a Rust core fits.
-  For fastest agent-framework integration, a Python or Go CLI/library is the pragmatic pick.
-  Decide based on whether this is primarily a *library agents import* or a *standalone tool*.
-- **Backend interface first.** Build the local-filesystem backend before S3 — it makes the
-  whole thing testable without AWS and proves the portability invariant by construction.
-- **Don't skip the manifest.** Scanning every object per recall is the obvious trap; the
-  index layer is what keeps recall cheap as bundles grow.
+- **Cached recall index.** Recall loads the whole bundle per call (one GET per object on S3) —
+  always fresh and correct, but a persisted BM25 index (rebuilt on manifest staleness) and/or
+  an S3 Select frontmatter prefilter is the next step for large S3 bundles.
+- **Graph edges.** The `links` field exists in the format but nothing walks or ships the graph
+  yet (no `link`/`export` tooling).
+- **Optional vector recall.** An embedding-ranked stage layered on BM25 — keep it optional; a
+  hard embedding dependency would break the portability guarantee.
