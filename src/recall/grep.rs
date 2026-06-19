@@ -37,6 +37,13 @@ impl GrepOptions {
 /// Search `records` for `opts.pattern`, returning a [`Hit`] per record with at least one
 /// match. Errors only if a `regex` pattern fails to compile.
 pub fn grep(records: &[Record], opts: &GrepOptions) -> Result<Vec<Hit>> {
+    // An empty (or whitespace-only) pattern means "no query" — return nothing, matching
+    // BM25's empty-query behavior. Otherwise an empty regex matches every field of every
+    // record and `grep "$UNSET_VAR"` would dump the whole bundle.
+    if opts.pattern.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
     let source = if opts.regex {
         opts.pattern.clone()
     } else {
@@ -49,28 +56,36 @@ pub fn grep(records: &[Record], opts: &GrepOptions) -> Result<Vec<Hit>> {
 
     let mut hits = Vec::new();
     for record in opts.filter.apply(records) {
+        let mut matched = false;
         let mut snippets = Vec::new();
-        consider(&mut snippets, &re, opts.max_snippets, "id", &record.meta.id);
+        let cap = opts.max_snippets;
+
+        consider(&re, &mut matched, &mut snippets, cap, "id", &record.meta.id);
         consider(
-            &mut snippets,
             &re,
-            opts.max_snippets,
+            &mut matched,
+            &mut snippets,
+            cap,
             "description",
             &record.meta.description,
         );
         for tag in &record.meta.tags {
-            consider(&mut snippets, &re, opts.max_snippets, "tag", tag);
+            consider(&re, &mut matched, &mut snippets, cap, "tag", tag);
         }
         for (n, line) in record.body.lines().enumerate() {
             consider(
-                &mut snippets,
                 &re,
-                opts.max_snippets,
+                &mut matched,
+                &mut snippets,
+                cap,
                 &format!("body:{}", n + 1),
                 line,
             );
         }
-        if !snippets.is_empty() {
+
+        // Emit the hit whenever the record matched — `max_snippets` caps the snippet volume,
+        // it must never hide a matching record (so `max_snippets = 0` still reports the match).
+        if matched {
             hits.push(Hit {
                 id: record.meta.id.clone(),
                 kind: record.meta.kind,
@@ -83,10 +98,20 @@ pub fn grep(records: &[Record], opts: &GrepOptions) -> Result<Vec<Hit>> {
     Ok(hits)
 }
 
-/// Push `label: text` if `text` matches and we're under the per-record cap.
-fn consider(snippets: &mut Vec<String>, re: &Regex, max: usize, label: &str, text: &str) {
-    if snippets.len() < max && re.is_match(text) {
-        snippets.push(format!("{label}: {}", text.trim()));
+/// Record a match (`matched`) and, while under the snippet cap, a `label: text` snippet.
+fn consider(
+    re: &Regex,
+    matched: &mut bool,
+    snippets: &mut Vec<String>,
+    cap: usize,
+    label: &str,
+    text: &str,
+) {
+    if re.is_match(text) {
+        *matched = true;
+        if snippets.len() < cap {
+            snippets.push(format!("{label}: {}", text.trim()));
+        }
     }
 }
 

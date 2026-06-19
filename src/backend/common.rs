@@ -46,3 +46,15 @@ pub(crate) fn safe_segments(s: &str) -> Vec<&str> {
         .filter(|p| !p.is_empty() && *p != "." && *p != "..")
         .collect()
 }
+
+/// FNV-1a 64-bit hash, as lowercase hex. Deterministic and stable across runs (unlike the
+/// std hashers), so it's safe to use for the recall-cache fingerprint that is compared between
+/// separate process invocations.
+pub(crate) fn fnv1a_hex(s: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}

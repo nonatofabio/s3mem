@@ -419,3 +419,155 @@ fn overlong_id_fails_gracefully() {
         Err(_) => panic!("over-long id PANICKED instead of erroring"),
     }
 }
+
+// ===========================================================================
+// EXPANDED SCENARIOS (round 3) — cross-tool portability of the YAML/markdown,
+// CRLF-authored files, and the previously-untested frontmatter fields
+// (source, links, every MemoryType) plus Unicode.
+// ===========================================================================
+
+// --- YAML 1.1 coercion: the "Norway problem" -------------------------------
+
+/// ASSUMPTION: the files are portable to "Obsidian/MkDocs and any other agent" (README).
+/// Probe: serde_yaml round-trips fine, but it emits `no`/`yes`/`on`/`off` UNQUOTED. A
+/// YAML-1.1 reader (PyYAML, many tools) coerces those to booleans — so a value written by
+/// s3mem is silently mis-typed by a portable consumer. String scalars must be emitted in a
+/// form that can't be coerced.
+#[test]
+fn string_values_survive_yaml_1_1_readers() {
+    let ambiguous = ["no", "yes", "on", "off", "y", "n"];
+    let mut leaked = Vec::new();
+    for v in ambiguous {
+        let mut m = meta("x");
+        m.description = v.to_string();
+        let md = Record::new(m, "b").to_markdown().unwrap();
+        // a safe rendering is quoted (`description: 'no'`) — bare `description: no` is not.
+        if md.contains(&format!("description: {v}\n")) {
+            leaked.push(v);
+        }
+    }
+    assert!(
+        leaked.is_empty(),
+        "values emitted unquoted (YAML-1.1 readers coerce to bool): {leaked:?}"
+    );
+}
+
+/// Same hazard inside a tags list — `tags: [no]` is read as `[false]` by a 1.1 parser.
+#[test]
+fn ambiguous_tags_survive_yaml_1_1_readers() {
+    let mut m = meta("x");
+    m.tags = vec!["no".into(), "yes".into()];
+    let md = Record::new(m, "b").to_markdown().unwrap();
+    // Block-style sequences put each value on its own line (`- no`); scan those, not the
+    // `tags:` header line.
+    let bare = md
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start().trim_start_matches("- ");
+            t == "no" || t == "yes"
+        })
+        .count();
+    assert_eq!(
+        bare, 0,
+        "tags emitted unquoted (a YAML-1.1 reader sees booleans):\n{md}"
+    );
+}
+
+// --- CRLF-authored document ------------------------------------------------
+
+/// ASSUMPTION: bodies are recovered byte-faithfully. Probe a fully-CRLF document (Windows
+/// editor / git autocrlf). The parser strips a leading/trailing `\n` but not the `\r` of a
+/// CRLF pair, so stray carriage returns leak into the body.
+#[test]
+fn crlf_document_body_has_no_stray_carriage_returns() {
+    let doc = "---\r\nid: x\r\ntype: semantic\r\ndescription: d\r\ncreated: 2026-01-01T00:00:00Z\r\nupdated: 2026-01-01T00:00:00Z\r\n---\r\n\r\nthe body\r\n";
+    let body = Record::parse(doc).unwrap().body;
+    assert_eq!(
+        body, "the body",
+        "CRLF document left stray \\r in the body: {body:?}"
+    );
+}
+
+// --- Previously-untested frontmatter fields --------------------------------
+
+#[test]
+fn source_and_links_round_trip_through_store() {
+    let root = temp_bundle("source-links");
+    let store = LocalStore::new(&root, "ns");
+    let mut m = meta("x");
+    m.source = Some("https://example.com/notes#frag".into());
+    m.links = vec!["other-a".into(), "other-b".into()];
+    store
+        .put(&Record::new(m.clone(), "see [[other-a]]"))
+        .unwrap();
+    let got = store.get("x").unwrap();
+    std::fs::remove_dir_all(&root).ok();
+    assert_eq!(got.meta.source, m.source);
+    assert_eq!(got.meta.links, m.links);
+}
+
+#[test]
+fn every_memory_type_round_trips() {
+    for kind in [
+        MemoryType::Semantic,
+        MemoryType::Episodic,
+        MemoryType::Procedural,
+        MemoryType::Reference,
+    ] {
+        let m = RecordMeta::new("x", kind, "d", "2026-01-01T00:00:00Z");
+        let md = Record::new(m, "b").to_markdown().unwrap();
+        assert_eq!(Record::parse(&md).unwrap().meta.kind, kind);
+    }
+}
+
+#[test]
+fn unknown_memory_type_is_rejected() {
+    let md = "---\nid: x\ntype: bogus\ndescription: d\ncreated: 2026-01-01T00:00:00Z\nupdated: 2026-01-01T00:00:00Z\n---\n\nb\n";
+    assert!(
+        Record::parse(md).is_err(),
+        "unknown `type:` should fail to parse"
+    );
+}
+
+// --- Unicode -----------------------------------------------------------------
+
+#[test]
+fn unicode_body_and_description_round_trip() {
+    let root = temp_bundle("unicode");
+    let store = LocalStore::new(&root, "ns");
+    let mut m = meta("x");
+    m.description = "café — 日本語 — \u{202E}rtl".into();
+    store
+        .put(&Record::new(m, "emoji 🚀 and 漢字 body"))
+        .unwrap();
+    let got = store.get("x").unwrap();
+    let index = std::fs::read_to_string(store.bundle_dir().join("index.md")).unwrap();
+    std::fs::remove_dir_all(&root).ok();
+    assert_eq!(got.body, "emoji 🚀 and 漢字 body");
+    assert!(
+        index.contains("日本語"),
+        "unicode description missing from index"
+    );
+}
+
+// --- MED-6 reinforcement: a path-shaped id can be surfaced by list() --------
+
+/// A file whose frontmatter id is a traversal-shaped string is reported by `list()` and
+/// rendered into `index.md`/`manifest.json`, yet `get()` rejects it as an invalid id —
+/// another way the read path and the resolve path disagree (see MED-6).
+#[test]
+fn listed_ids_are_all_resolvable() {
+    let root = temp_bundle("unresolvable");
+    let store = LocalStore::new(&root, "ns");
+    let dir = store.bundle_dir().join("memories");
+    std::fs::create_dir_all(&dir).unwrap();
+    let body = "---\nid: ../escape\ntype: semantic\ndescription: d\ncreated: 2026-01-01T00:00:00Z\nupdated: 2026-01-01T00:00:00Z\n---\n\nb\n";
+    std::fs::write(dir.join("safe-name.md"), body).unwrap();
+    let listed = store.list().unwrap();
+    let all_resolvable = listed.iter().all(|id| store.get(id).is_ok());
+    std::fs::remove_dir_all(&root).ok();
+    assert!(
+        all_resolvable,
+        "list() surfaced an id get() can't resolve: {listed:?}"
+    );
+}

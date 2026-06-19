@@ -170,11 +170,23 @@ impl Record {
 
         // Everything after the closing delimiter is the body, minus the single blank-line
         // separator and single trailing newline that `to_markdown` adds.
+        // The separator and trailing newline may be `\n` (our output) or `\r\n` (a document
+        // authored by a Windows editor / git autocrlf), so strip either — without disturbing
+        // any CRLFs *inside* the body that we wrote ourselves.
         let rest = &input[consumed..];
-        let rest = rest.strip_prefix('\n').unwrap_or(rest);
-        let body = rest.strip_suffix('\n').unwrap_or(rest).to_string();
+        let rest = rest
+            .strip_prefix("\r\n")
+            .or_else(|| rest.strip_prefix('\n'))
+            .unwrap_or(rest);
+        let rest = rest
+            .strip_suffix("\r\n")
+            .or_else(|| rest.strip_suffix('\n'))
+            .unwrap_or(rest);
 
-        Ok(Record { meta, body })
+        Ok(Record {
+            meta,
+            body: rest.to_string(),
+        })
     }
 
     /// Render back to the on-disk markdown form (`---` frontmatter, blank line, body).
@@ -197,8 +209,66 @@ impl Record {
         } else {
             serde_yaml::to_string(&self.meta)? // ends with a newline
         };
-        Ok(format!("---\n{yaml}---\n\n{}\n", self.body))
+        Ok(format!(
+            "---\n{}---\n\n{}\n",
+            harden_yaml_1_1(&yaml),
+            self.body
+        ))
     }
+}
+
+/// serde_yaml emits YAML 1.2, where `no`/`yes`/`on`/`off`/`null`/`42` are plain strings — but
+/// a YAML 1.1 reader (PyYAML, many Obsidian/MkDocs plugins, "any other agent" the README
+/// promises portability to) coerces those bare tokens to booleans/null/numbers. We quote any
+/// such bare scalar so a string stays a string everywhere. Over-quoting is harmless: the value
+/// is unchanged, only its rendering.
+fn harden_yaml_1_1(yaml: &str) -> String {
+    let mut out: String = yaml.lines().map(harden_line).collect::<Vec<_>>().join("\n");
+    out.push('\n');
+    out
+}
+
+fn harden_line(line: &str) -> String {
+    let indent_len = line.len() - line.trim_start().len();
+    let (indent, rest) = line.split_at(indent_len);
+
+    // Block-sequence item: `- value`
+    if let Some(value) = rest.strip_prefix("- ") {
+        if needs_quoting(value) {
+            return format!("{indent}- '{value}'");
+        }
+        return line.to_string();
+    }
+    // Mapping entry: `key: value` (a bare value can't contain ": ", so first match is safe)
+    if let Some(pos) = rest.find(": ") {
+        let (key, value) = (&rest[..pos], &rest[pos + 2..]);
+        if needs_quoting(value) {
+            return format!("{indent}{key}: '{value}'");
+        }
+    }
+    line.to_string()
+}
+
+/// True if `value` is a bare scalar a YAML 1.1 resolver would coerce away from a string.
+fn needs_quoting(value: &str) -> bool {
+    // Already quoted / a flow or block indicator / anchor / alias → serde_yaml handled it.
+    let Some(first) = value.bytes().next() else {
+        return false;
+    };
+    if matches!(
+        first,
+        b'\'' | b'"' | b'[' | b'{' | b'|' | b'>' | b'&' | b'*' | b'!'
+    ) {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    let boolish = matches!(
+        lower.as_str(),
+        "y" | "n" | "yes" | "no" | "true" | "false" | "on" | "off"
+    );
+    let nullish = matches!(lower.as_str(), "null" | "none" | "~");
+    let numberish = value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok();
+    boolish || nullish || numberish
 }
 
 #[cfg(test)]

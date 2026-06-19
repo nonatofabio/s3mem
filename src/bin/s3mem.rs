@@ -116,9 +116,9 @@ fn run() -> CliResult {
             tags,
             pretty,
         } => {
-            let records = store.records()?;
+            let index = s3mem::load_or_build_index(store.as_ref())?;
             let filter = Filter { kinds, tags };
-            let hits = s3mem::bm25(&records, &query, &filter, k);
+            let hits = index.search(&query, &filter, k);
             print_hits(&hits, pretty)?;
         }
         Command::Grep {
@@ -129,7 +129,7 @@ fn run() -> CliResult {
             tags,
             pretty,
         } => {
-            let records = store.records()?;
+            let index = s3mem::load_or_build_index(store.as_ref())?;
             let opts = GrepOptions {
                 pattern,
                 regex,
@@ -137,7 +137,7 @@ fn run() -> CliResult {
                 filter: Filter { kinds, tags },
                 max_snippets: 5,
             };
-            let hits = s3mem::grep(&records, &opts)?;
+            let hits = index.grep(&opts)?;
             print_hits(&hits, pretty)?;
         }
         Command::Get { id } => {

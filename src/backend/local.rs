@@ -11,7 +11,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::backend::common::{encode_id, safe_segments, validate_id};
+use crate::backend::common::{self, encode_id, safe_segments, validate_id};
 use crate::error::{Error, Result};
 use crate::record::Record;
 use crate::store::{Manifest, ManifestEntry, Store};
@@ -75,6 +75,15 @@ impl LocalStore {
             }
             let text = fs::read_to_string(&path).map_err(|e| Error::io(&path, e))?;
             match Record::parse(&text) {
+                Ok(record) if validate_id(&record.meta.id).is_err() => {
+                    // An invalid frontmatter id (e.g. `../escape`) can never be resolved by
+                    // `get`/`delete`, so it must not be surfaced by `list`/`manifest`/recall.
+                    eprintln!(
+                        "s3mem: skipping memory file {} with invalid id `{}`",
+                        path.display(),
+                        record.meta.id
+                    );
+                }
                 Ok(record) => {
                     let file_name = path
                         .file_name()
@@ -189,6 +198,55 @@ impl Store for LocalStore {
 
     fn records(&self) -> Result<Vec<Record>> {
         Ok(self.read_entries()?.into_iter().map(|(_, r)| r).collect())
+    }
+
+    fn fingerprint(&self) -> Result<String> {
+        let dir = self.memories_dir();
+        let read_dir = match fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(common::fnv1a_hex("")),
+            Err(e) => return Err(Error::io(&dir, e)),
+        };
+
+        // (filename, size, mtime) per memory file — changes whenever a memory is written.
+        let mut parts = Vec::new();
+        for entry in read_dir {
+            let entry = entry.map_err(|e| Error::io(&dir, e))?;
+            let path = entry.path();
+            if !is_markdown(&path) {
+                continue;
+            }
+            let meta = fs::metadata(&path).map_err(|e| Error::io(&path, e))?;
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            parts.push(format!("{name}:{}:{mtime}", meta.len()));
+        }
+        parts.sort();
+        Ok(common::fnv1a_hex(&parts.join("\n")))
+    }
+
+    fn read_artifact(&self, name: &str) -> Result<Option<String>> {
+        let path = self.bundle_dir().join(name);
+        match fs::read_to_string(&path) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::io(&path, e)),
+        }
+    }
+
+    fn write_artifact(&self, name: &str, content: &str) -> Result<()> {
+        let dir = self.bundle_dir();
+        fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
+        let path = dir.join(name);
+        fs::write(&path, content).map_err(|e| Error::io(&path, e))
     }
 }
 

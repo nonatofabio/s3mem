@@ -1,14 +1,64 @@
-//! Shared tokenizer for the BM25 path. Deliberately minimal: lowercase, split on any
-//! non-alphanumeric character (so `deploy-key` and `deploy_key` both yield `deploy` + `key`),
-//! and drop single-character tokens. No stemming or stopword removal yet — both are obvious
-//! future refinements but each adds a dependency or a wordlist we don't need for v1.
+//! Shared tokenizer for the BM25 path. Lowercase, split on non-alphanumerics (so `deploy-key`
+//! and `deploy_key` both yield `deploy` + `key`), drop single-character Latin tokens.
+//!
+//! CJK scripts aren't space-delimited, so `char::is_alphanumeric` would turn a whole run like
+//! `日本語` into one token and BM25 would never match the substring `日本` (which the grep
+//! path *does* find). To keep ranked recall from silently missing non-Latin memories, a CJK
+//! run is emitted as per-character unigrams **and** overlapping bigrams, so `日本` matches
+//! `日本語`. (Stemming / stopwords remain future refinements.)
 
-/// Split `text` into lowercase alphanumeric tokens of length ≥ 2.
+/// Split `text` into search tokens (see module docs).
 pub fn tokenize(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.chars().take(2).count() == 2)
-        .map(str::to_lowercase)
-        .collect()
+    let mut out = Vec::new();
+    let mut latin = String::new();
+    let mut cjk: Vec<char> = Vec::new();
+
+    for c in text.chars() {
+        if is_cjk(c) {
+            flush_latin(&mut latin, &mut out);
+            cjk.push(c);
+        } else if c.is_alphanumeric() {
+            flush_cjk(&mut cjk, &mut out);
+            latin.extend(c.to_lowercase());
+        } else {
+            flush_latin(&mut latin, &mut out);
+            flush_cjk(&mut cjk, &mut out);
+        }
+    }
+    flush_latin(&mut latin, &mut out);
+    flush_cjk(&mut cjk, &mut out);
+    out
+}
+
+/// Push the accumulated Latin run if it's at least 2 characters; reset it either way.
+fn flush_latin(latin: &mut String, out: &mut Vec<String>) {
+    if latin.chars().take(2).count() == 2 {
+        out.push(std::mem::take(latin));
+    } else {
+        latin.clear();
+    }
+}
+
+/// Push a CJK run as unigrams plus overlapping bigrams, so substrings still match.
+fn flush_cjk(cjk: &mut Vec<char>, out: &mut Vec<String>) {
+    for &c in cjk.iter() {
+        out.push(c.to_string());
+    }
+    for window in cjk.windows(2) {
+        out.push(window.iter().collect());
+    }
+    cjk.clear();
+}
+
+/// CJK ideographs / kana / hangul, where each character is a meaningful unit.
+fn is_cjk(c: char) -> bool {
+    let u = c as u32;
+    (0x3040..=0x30FF).contains(&u)        // Hiragana + Katakana
+        || (0x3400..=0x4DBF).contains(&u) // CJK Extension A
+        || (0x4E00..=0x9FFF).contains(&u) // CJK Unified Ideographs
+        || (0xAC00..=0xD7AF).contains(&u) // Hangul syllables
+        || (0xF900..=0xFAFF).contains(&u) // CJK Compatibility Ideographs
+        || (0x20000..=0x2FA1F).contains(&u) // CJK Extension B and beyond
 }
 
 /// Truncate a snippet to at most `max` characters on a char boundary, appending `…` if cut.

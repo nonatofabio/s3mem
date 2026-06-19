@@ -1,25 +1,15 @@
-//! Okapi BM25 over the corpus, hand-rolled (no search-engine dependency).
+//! Okapi BM25 over a `&[Record]` corpus, hand-rolled (no search-engine dependency).
 //!
-//! Per query we compute IDF from the (prefiltered) corpus, then score each candidate. Fields
-//! are weighted by repeating their tokens: a hit in the one-line `description` should outrank
-//! the same word buried in a long body. Weights: `description` ×3, `id` ×2, each tag ×2,
-//! `body` ×1.
+//! This is the uncached path: it tokenizes the candidates on the fly and scores them. The
+//! cached [`Index`](crate::recall::index::Index) does the same scoring against precomputed
+//! term frequencies — both share [`crate::recall::score`], so they rank identically.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
-use crate::recall::tokenize::{tokenize, truncate};
+use crate::recall::score::{best_snippet, rank, weighted_term_freqs};
+use crate::recall::tokenize::tokenize;
 use crate::recall::{Filter, Hit};
 use crate::record::Record;
-
-const K1: f32 = 1.2;
-const B: f32 = 0.75;
-
-const W_DESCRIPTION: usize = 3;
-const W_ID: usize = 2;
-const W_TAG: usize = 2;
-const W_BODY: usize = 1;
-
-const SNIPPET_CHARS: usize = 200;
 
 /// Rank `records` against `query` with BM25, returning the top `k` hits (score-descending,
 /// score > 0). Applies `filter` first. Empty query or empty candidate set → no hits.
@@ -27,49 +17,21 @@ pub fn bm25(records: &[Record], query: &str, filter: &Filter, k: usize) -> Vec<H
     let mut query_terms = tokenize(query);
     query_terms.sort();
     query_terms.dedup();
-
-    let candidates = filter.apply(records);
-    if query_terms.is_empty() || candidates.is_empty() {
+    if query_terms.is_empty() {
         return Vec::new();
     }
 
-    let doc_tf: Vec<HashMap<String, u32>> = candidates
-        .iter()
-        .map(|r| term_freqs(&doc_tokens(r)))
-        .collect();
-    let doc_len: Vec<f32> = doc_tf
-        .iter()
-        .map(|tf| tf.values().sum::<u32>() as f32)
-        .collect();
-    let n = candidates.len() as f32;
-    let avgdl = (doc_len.iter().sum::<f32>() / n).max(1.0);
-
-    // Document frequency of each query term across the candidate set.
-    let df: HashMap<&str, f32> = query_terms
-        .iter()
-        .map(|term| {
-            let count = doc_tf.iter().filter(|tf| tf.contains_key(term)).count();
-            (term.as_str(), count as f32)
-        })
-        .collect();
-
-    let mut scored: Vec<(usize, f32)> = Vec::new();
-    for (i, tf) in doc_tf.iter().enumerate() {
-        let mut score = 0.0f32;
-        for term in &query_terms {
-            let Some(&freq) = tf.get(term) else { continue };
-            let f = freq as f32;
-            let n_q = df[term.as_str()];
-            let idf = (1.0 + (n - n_q + 0.5) / (n_q + 0.5)).ln();
-            let denom = f + K1 * (1.0 - B + B * doc_len[i] / avgdl);
-            score += idf * (f * (K1 + 1.0)) / denom;
-        }
-        if score > 0.0 {
-            scored.push((i, score));
-        }
+    let candidates = filter.apply(records);
+    if candidates.is_empty() {
+        return Vec::new();
     }
 
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let tf_owned: Vec<BTreeMap<String, u32>> =
+        candidates.iter().map(|r| weighted_term_freqs(r)).collect();
+    let tf: Vec<&BTreeMap<String, u32>> = tf_owned.iter().collect();
+    let len: Vec<u32> = tf_owned.iter().map(|t| t.values().sum()).collect();
+
+    let mut scored = rank(&query_terms, &tf, &len);
     scored.truncate(k);
     scored
         .into_iter()
@@ -80,54 +42,10 @@ pub fn bm25(records: &[Record], query: &str, filter: &Filter, k: usize) -> Vec<H
                 kind: r.meta.kind,
                 description: r.meta.description.clone(),
                 score: Some(score),
-                snippets: vec![best_snippet(r, &query_terms)],
+                snippets: vec![best_snippet(&r.body, &r.meta.description, &query_terms)],
             }
         })
         .collect()
-}
-
-/// The weighted token bag for a record (field weights applied by repetition).
-fn doc_tokens(record: &Record) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut push = |text: &str, weight: usize| {
-        for tok in tokenize(text) {
-            for _ in 0..weight {
-                tokens.push(tok.clone());
-            }
-        }
-    };
-    push(&record.meta.id, W_ID);
-    push(&record.meta.description, W_DESCRIPTION);
-    for tag in &record.meta.tags {
-        push(tag, W_TAG);
-    }
-    push(&record.body, W_BODY);
-    tokens
-}
-
-fn term_freqs(tokens: &[String]) -> HashMap<String, u32> {
-    let mut map = HashMap::new();
-    for tok in tokens {
-        *map.entry(tok.clone()).or_insert(0) += 1;
-    }
-    map
-}
-
-/// The body line with the most query-term hits (fallback: the description), truncated.
-fn best_snippet(record: &Record, query_terms: &[String]) -> String {
-    let mut best: Option<(usize, &str)> = None;
-    for line in record.body.lines() {
-        let lower = line.to_lowercase();
-        let hits = query_terms
-            .iter()
-            .filter(|t| lower.contains(t.as_str()))
-            .count();
-        if hits > 0 && best.is_none_or(|(prev, _)| hits > prev) {
-            best = Some((hits, line));
-        }
-    }
-    let text = best.map(|(_, l)| l).unwrap_or(&record.meta.description);
-    truncate(text.trim(), SNIPPET_CHARS)
 }
 
 #[cfg(test)]

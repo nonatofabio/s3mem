@@ -129,6 +129,13 @@ BM25 is hand-rolled (no search-engine dependency) and field-weighted — a hit i
 frontmatter filter (`--type` / `--tag`) and return small hits (`id`, `description`, score,
 snippet) so an agent can triage, then `get` only the notes it wants.
 
+Recall is served from a **cached index** (`recall-index.json` in the bundle): a precomputed
+BM25 index that turns recall into a single fetch instead of one read per memory. It's
+validated by a cheap content fingerprint (a hash of the `memories/` listing — file
+size/mtime locally, object ETag on S3), so it's rebuilt automatically when the bundle
+changes, including out-of-band edits. The cache is transparent — results are identical to the
+uncached path.
+
 ## For agents: the skill
 
 [`skills/s3mem-memory/SKILL.md`](skills/s3mem-memory/SKILL.md) wraps the CLI as an agent
@@ -159,9 +166,9 @@ invariants worth preserving.
 
 ## Roadmap
 
-- **Cached recall index** — recall currently loads the whole bundle per call (one GET per
-  object on S3). Always fresh and correct, but a persisted BM25 index (rebuilt on staleness)
-  and/or an S3 Select frontmatter prefilter is the next step for large S3 bundles.
+- **S3 Select prefilter** — the cached index makes recall a single fetch, but for very large
+  S3 bundles even that one object grows; pushing the `type`/`tag` prefilter down to S3 Select
+  would avoid fetching the whole index.
 - **Graph edges** — the `links` field exists in the format; `link`/`export` tooling to walk
   and ship the graph does not yet.
 - **Optional vector recall** — an embedding-ranked stage layered on BM25, kept optional so it

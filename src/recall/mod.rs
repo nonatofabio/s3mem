@@ -12,6 +12,8 @@
 
 pub mod bm25;
 pub mod grep;
+pub mod index;
+mod score;
 pub mod tokenize;
 
 use serde::Serialize;
@@ -20,6 +22,7 @@ use crate::record::{MemoryType, Record};
 
 pub use bm25::bm25;
 pub use grep::{grep, GrepOptions};
+pub use index::{load_or_build_index, Index, RECALL_INDEX_FILE};
 
 /// A frontmatter prefilter applied before BM25 scoring or grep scanning.
 ///
@@ -32,16 +35,19 @@ pub struct Filter {
 }
 
 impl Filter {
-    pub fn matches(&self, record: &Record) -> bool {
-        let kind_ok = self.kinds.is_empty() || self.kinds.contains(&record.meta.kind);
-        let tags_ok = self.tags.iter().all(|want| {
-            record
-                .meta
-                .tags
-                .iter()
-                .any(|have| have.eq_ignore_ascii_case(want))
-        });
+    /// Match against a record's kind and tags directly — usable for both [`Record`]s and the
+    /// cached index's documents.
+    pub(crate) fn matches_meta(&self, kind: MemoryType, tags: &[String]) -> bool {
+        let kind_ok = self.kinds.is_empty() || self.kinds.contains(&kind);
+        let tags_ok = self
+            .tags
+            .iter()
+            .all(|want| tags.iter().any(|have| have.eq_ignore_ascii_case(want)));
         kind_ok && tags_ok
+    }
+
+    pub fn matches(&self, record: &Record) -> bool {
+        self.matches_meta(record.meta.kind, &record.meta.tags)
     }
 
     /// Narrow `records` to those passing the filter.

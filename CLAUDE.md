@@ -6,10 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The crate ships the **format layer** ([`Record`]), the **local-filesystem backend**
 ([`LocalStore`]), the **S3 backend** ([`S3Store`], behind the `s3` feature) — both behind the
-same [`Store`] trait — the **recall layer** (BM25 + grep), the **`s3mem` CLI** (`cli` feature),
-and an agent **skill** (`skills/s3mem-memory/`). A persisted/cached recall index is the main
-piece not yet built. The architecture section is the design of record — build outward from here
-and keep this file current as tooling lands.
+same [`Store`] trait — the **recall layer** (BM25 + grep, with a fingerprint-gated cached
+index), the **`s3mem` CLI** (`cli` feature), and an agent **skill** (`skills/s3mem-memory/`).
+The architecture section is the design of record — build outward from here and keep this file
+current as tooling lands.
 
 ### Commands
 
@@ -40,10 +40,12 @@ src/
   error.rs          Error enum (thiserror), Result alias
   util.rs           now_iso() RFC-3339 timestamp helper
   recall/
-    mod.rs          Filter + Hit; re-exports bm25 / grep
-    bm25.rs         hand-rolled Okapi BM25 (field-weighted), ranked recall
+    mod.rs          Filter + Hit; re-exports bm25 / grep / Index
+    score.rs        shared BM25 math (weights, rank, snippet) — one impl for both paths
+    bm25.rs         uncached Okapi BM25 over a &[Record]
     grep.rs         literal/regex match with line-numbered snippets
-    tokenize.rs     shared tokenizer + snippet truncation
+    index.rs        cached BM25 index (recall-index.json) + load_or_build_index
+    tokenize.rs     tokenizer (CJK-aware: unigrams+bigrams) + snippet truncation
   backend/
     mod.rs          backend wiring (common + local, s3 under cfg)
     common.rs       SHARED key rules: validate_id, encode_id, safe_segments (parity-critical)
@@ -53,7 +55,9 @@ src/
 skills/s3mem-memory/SKILL.md   agent skill wrapping the CLI (when to use recall vs grep)
 tests/local_store.rs  integration tests against a temp-dir bundle
 tests/qa_probes.rs    adversarial corner-case suite (see QA_FINDINGS.md)
+tests/recall_probes.rs  adversarial recall-layer probes (see QA_FINDINGS.md)
 tests/recall.rs       recall over a real LocalStore corpus
+tests/cache.rs        cached-index lifecycle (write/reuse/self-heal/transparency)
 tests/s3_store.rs     live S3 round-trip, gated on S3MEM_TEST_BUCKET (feature = "s3")
 ```
 
@@ -61,11 +65,20 @@ Key implementation notes for future work:
 - **Recall is a layer over `Store`, not part of it.** `bm25`/`grep` are pure functions over a
   `&[Record]` slice (from `Store::records()`), so they're backend-agnostic and unit-testable
   without any store. Both run a cheap frontmatter `Filter` (type/tags) first — that's where an
-  S3 Select prefilter would plug in later.
-- **BM25 is hand-rolled** (`recall/bm25.rs`, k1=1.2/b=0.75), field-weighted by repeating tokens
-  (description ×3, id ×2, tags ×2, body ×1). No search-engine dependency; corpus is loaded and
-  scored in memory per call. Fine to thousands of notes; a cached/persisted index is the next
-  step for very large S3 bundles (every `recall` currently does one GET per object).
+  S3 Select prefilter would plug in later. The BM25 math lives once in `recall/score.rs`, used
+  by both the uncached `bm25()` and the cached `Index` so their rankings can't drift.
+- **BM25 is hand-rolled** (k1=1.2/b=0.75), field-weighted by repeating tokens (description ×3,
+  id ×2, tags ×2, body ×1). No search-engine dependency.
+- **The cached index is the recall hot path.** `load_or_build_index` reads `recall-index.json`
+  and uses it when `Store::fingerprint()` still matches, else rebuilds from `records()` and
+  re-caches (self-healing on out-of-band edits). Building stays in the recall layer (lazy, on
+  read) so **backends don't depend on recall** — they only expose generic `fingerprint`,
+  `read_artifact`, `write_artifact`. `fingerprint()` must stay cheap (listing metadata only —
+  size/mtime locally, ETag on S3 — never body reads) and must exclude derived artifacts (it
+  scans `memories/` only), or writing the cache would change the fingerprint and loop. Bump
+  `INDEX_VERSION` if the index format or scoring weights change.
+- **Recall results must be backend/cache-transparent** — `Index::search` recomputes df/avgdl
+  over the filtered candidates exactly like `bm25()`, so cached == uncached (a test pins this).
 - The CLI prints **JSON by default** for the recall tools (agent-parseable), `--pretty` for
   humans. Backend/namespace come from `S3MEM_PATH`/`S3MEM_BUCKET`/`S3MEM_NAMESPACE` env vars.
 - `Store` is the seam, and it's **synchronous**. The AWS SDK is async, so `S3Store` owns a
@@ -99,8 +112,9 @@ Key implementation notes for future work:
 - **The store never stamps `updated`** — callers must bump it themselves before `put`. If a
   higher-level `remember()` API lands, that's where the auto-stamp belongs.
 
-See [`QA_FINDINGS.md`](QA_FINDINGS.md) and [`tests/qa_probes.rs`](tests/qa_probes.rs) for the
-corner cases these invariants defend (all 25 probes pass).
+See [`QA_FINDINGS.md`](QA_FINDINGS.md), [`tests/qa_probes.rs`](tests/qa_probes.rs), and
+[`tests/recall_probes.rs`](tests/recall_probes.rs) for the corner cases these invariants defend
+(all 33 format/store + 9 recall probes pass).
 
 ## Architecture (as built)
 
@@ -109,9 +123,9 @@ implemented shape — five layers, each independent of the ones above it:
 
 ```
 Skill / CLI ──  s3mem remember · recall · grep · get · list · forget   (bin/s3mem.rs, skills/)
-Recall ──────  bm25() ranked  +  grep() literal/regex, over Store::records()   (recall/)
-Store ───────  put/get/list/delete/manifest/records — LocalStore | S3Store     (backend/)
-Index ───────  manifest.json + index.md, derived on every write (cache, not truth)
+Recall ──────  bm25() / Index ranked + grep(), cached in recall-index.json     (recall/)
+Store ───────  put/get/list/delete/manifest/records/fingerprint/artifact       (backend/)
+Index ───────  manifest.json + index.md (write) · recall-index.json (lazy, fingerprint-gated)
 Format (OKF) ─ Record: frontmatter + body; parse ⇄ to_markdown                 (record.rs)
 ```
 
@@ -125,10 +139,12 @@ editing a backend or the format.
 
 ## Not yet built (roadmap)
 
-- **Cached recall index.** Recall loads the whole bundle per call (one GET per object on S3) —
-  always fresh and correct, but a persisted BM25 index (rebuilt on manifest staleness) and/or
-  an S3 Select frontmatter prefilter is the next step for large S3 bundles.
+- **S3 Select prefilter.** The cached index makes recall a single fetch, but a very large
+  bundle's index object itself grows; pushing the `type`/`tag` prefilter down to S3 Select
+  would avoid fetching the whole index.
 - **Graph edges.** The `links` field exists in the format but nothing walks or ships the graph
   yet (no `link`/`export` tooling).
 - **Optional vector recall.** An embedding-ranked stage layered on BM25 — keep it optional; a
   hard embedding dependency would break the portability guarantee.
+- **CJK recall** is unigram+bigram (`recall/tokenize.rs`); a proper Unicode word segmenter
+  would improve precision if non-Latin memory becomes common.

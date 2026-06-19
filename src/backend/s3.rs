@@ -21,7 +21,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use tokio::runtime::Runtime;
 
-use crate::backend::common::{encode_id, safe_segments, validate_id};
+use crate::backend::common::{self, encode_id, safe_segments, validate_id};
 use crate::error::{Error, Result};
 use crate::record::Record;
 use crate::store::{Manifest, ManifestEntry, Store};
@@ -184,6 +184,51 @@ impl S3Store {
         Ok(())
     }
 
+    /// `(key, etag-or-size)` for every memory object — the cheap content fingerprint inputs.
+    /// ETag is the content MD5 for single-part uploads, so it changes when a body changes; we
+    /// fall back to size if some object lacks an ETag.
+    async fn fingerprint_parts(&self) -> Result<Vec<String>> {
+        let prefix = self.memories_prefix();
+        let mut parts = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&prefix);
+            if let Some(t) = &token {
+                req = req.continuation_token(t);
+            }
+            let out = req
+                .send()
+                .await
+                .map_err(|e| Error::Backend(format!("list_objects_v2 {prefix}: {e}")))?;
+            for obj in out.contents() {
+                let Some(key) = obj.key() else { continue };
+                if !key.ends_with(".md") {
+                    continue;
+                }
+                let tag = obj
+                    .e_tag()
+                    .map(str::to_string)
+                    .or_else(|| obj.size().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                parts.push(format!("{key}:{tag}"));
+            }
+            if out.is_truncated().unwrap_or(false) {
+                token = out.next_continuation_token().map(str::to_string);
+                if token.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        parts.sort();
+        Ok(parts)
+    }
+
     /// List every object key under `prefix`, following pagination.
     async fn list_keys(&self, prefix: &str) -> Result<Vec<String>> {
         let mut keys = Vec::new();
@@ -234,6 +279,13 @@ impl S3Store {
                 continue; // raced delete
             };
             match Record::parse(&text) {
+                Ok(record) if validate_id(&record.meta.id).is_err() => {
+                    // Invalid frontmatter id → unresolvable by get/delete; don't surface it.
+                    eprintln!(
+                        "s3mem: skipping object {key} with invalid id `{}`",
+                        record.meta.id
+                    );
+                }
                 Ok(record) => out.push((self.relative_key(&key), record)),
                 Err(err) => eprintln!("s3mem: skipping unparseable object {key}: {err}"),
             }
@@ -359,6 +411,22 @@ impl Store for S3Store {
                 .map(|(_, r)| r)
                 .collect())
         })
+    }
+
+    fn fingerprint(&self) -> Result<String> {
+        let parts = self.runtime.block_on(self.fingerprint_parts())?;
+        Ok(common::fnv1a_hex(&parts.join("\n")))
+    }
+
+    fn read_artifact(&self, name: &str) -> Result<Option<String>> {
+        let key = self.meta_key(name);
+        self.runtime.block_on(self.get_object(&key))
+    }
+
+    fn write_artifact(&self, name: &str, content: &str) -> Result<()> {
+        let key = self.meta_key(name);
+        self.runtime
+            .block_on(self.put_object(&key, content.to_string()))
     }
 }
 

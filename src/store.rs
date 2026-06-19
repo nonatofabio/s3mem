@@ -30,6 +30,18 @@ pub trait Store {
     fn records(&self) -> Result<Vec<Record>> {
         self.list()?.iter().map(|id| self.get(id)).collect()
     }
+
+    /// A cheap, stable hash of the bundle's *source* state (`memories/` objects only, never the
+    /// derived artifacts), computed from listing metadata without reading bodies. Used to detect
+    /// when a cached recall index is stale. Must change whenever a memory is added, removed, or
+    /// modified, and must be identical across process runs for an unchanged bundle.
+    fn fingerprint(&self) -> Result<String>;
+
+    /// Read a bundle-root artifact (e.g. the recall index) by name, or `None` if absent.
+    fn read_artifact(&self, name: &str) -> Result<Option<String>>;
+
+    /// Write a bundle-root artifact by name.
+    fn write_artifact(&self, name: &str, content: &str) -> Result<()>;
 }
 
 /// One manifest row: the frontmatter fields cheap enough to filter on before touching bodies.
