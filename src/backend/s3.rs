@@ -349,6 +349,17 @@ impl Store for S3Store {
     fn manifest(&self) -> Result<Manifest> {
         self.runtime.block_on(self.build_manifest())
     }
+
+    fn records(&self) -> Result<Vec<Record>> {
+        self.runtime.block_on(async {
+            Ok(self
+                .read_entries()
+                .await?
+                .into_iter()
+                .map(|(_, r)| r)
+                .collect())
+        })
+    }
 }
 
 fn build_runtime() -> Result<Runtime> {

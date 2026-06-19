@@ -24,6 +24,12 @@ pub trait Store {
 
     /// Build the manifest digest of the bundle's frontmatter.
     fn manifest(&self) -> Result<Manifest>;
+
+    /// Load every record in the bundle — the corpus the recall layer ranks/scans over.
+    /// The default reads each record via `list`+`get`; backends override for a single pass.
+    fn records(&self) -> Result<Vec<Record>> {
+        self.list()?.iter().map(|id| self.get(id)).collect()
+    }
 }
 
 /// One manifest row: the frontmatter fields cheap enough to filter on before touching bodies.

@@ -10,8 +10,10 @@ readme = "README.md"
 [features]
 default = []
 # The S3 backend pulls in the AWS SDK + a Tokio runtime. Off by default so the core crate
-# (format layer + local-FS backend) stays dependency-light and AWS-free.
+# (format layer + local-FS backend + recall) stays dependency-light and AWS-free.
 s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:tokio"]
+# The `s3mem` CLI. Off by default so library users don't pull clap.
+cli = ["dep:clap"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -19,7 +21,14 @@ serde_yaml = "0.9"
 serde_json = "1"
 thiserror = "1"
 time = { version = "0.3", features = ["formatting"] }
+regex = "1"
 
 aws-config = { version = "1", optional = true }
 aws-sdk-s3 = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+clap = { version = "4", features = ["derive", "env"], optional = true }
+
+[[bin]]
+name = "s3mem"
+path = "src/bin/s3mem.rs"
+required-features = ["cli"]

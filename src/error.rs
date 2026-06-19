@@ -28,6 +28,10 @@ pub enum Error {
     /// error type stays free of any backend SDK in the default build.
     #[error("backend error: {0}")]
     Backend(String),
+
+    /// An invalid `grep` search pattern (bad regex).
+    #[error("invalid search pattern: {0}")]
+    Pattern(String),
 }
 
 impl Error {

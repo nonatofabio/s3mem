@@ -37,6 +37,7 @@
 
 pub mod backend;
 pub mod error;
+pub mod recall;
 pub mod record;
 pub mod store;
 mod util;
@@ -45,6 +46,7 @@ pub use backend::local::LocalStore;
 #[cfg(feature = "s3")]
 pub use backend::s3::S3Store;
 pub use error::{Error, Result};
+pub use recall::{bm25, grep, Filter, GrepOptions, Hit};
 pub use record::{MemoryType, Record, RecordMeta};
 pub use store::{Manifest, ManifestEntry, Store};
 pub use util::now_iso;

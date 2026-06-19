@@ -5,24 +5,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status: early scaffold (Rust)
 
 The crate ships the **format layer** ([`Record`]), the **local-filesystem backend**
-([`LocalStore`]), and the **S3 backend** ([`S3Store`], behind the `s3` feature) — both
-implementing the same [`Store`] trait. Search/recall and an agent CLI are not built yet. The
-architecture section is the design of record — build outward from here and keep this file
-current as tooling lands.
+([`LocalStore`]), the **S3 backend** ([`S3Store`], behind the `s3` feature) — both behind the
+same [`Store`] trait — the **recall layer** (BM25 + grep), the **`s3mem` CLI** (`cli` feature),
+and an agent **skill** (`skills/s3mem-memory/`). A persisted/cached recall index is the main
+piece not yet built. The architecture section is the design of record — build outward from here
+and keep this file current as tooling lands.
 
 ### Commands
 
 ```bash
 cargo test               # core suite (unit + integration + doctests), no AWS deps
-cargo test --features s3                 # also builds S3 backend + its key-construction tests
-cargo build --features s3                # compile the S3 backend (pulls the AWS SDK)
-cargo test --test local_store            # just the local-FS integration tests
-cargo test round_trips_through_markdown  # a single test by name
-cargo clippy --all-targets [--features s3]   # lints (kept clean on both feature sets)
-cargo fmt                                # format (rustfmt)
+cargo test --features s3                  # also builds S3 backend + its key tests
+cargo build --features cli                # build the `s3mem` CLI (local backend only)
+cargo build --release --features cli,s3   # build the CLI with S3 support (for the skill)
+cargo test --test recall                  # recall integration tests over a LocalStore
+cargo test round_trips_through_markdown   # a single test by name
+cargo clippy --all-targets --features cli,s3   # lints (kept clean across feature sets)
+cargo fmt                                 # format (rustfmt)
 
 # Live S3 round-trip (skipped unless a bucket + AWS creds are present):
 S3MEM_TEST_BUCKET=my-bucket cargo test --features s3 --test s3_store -- --nocapture
+
+# Drive the CLI:
+S3MEM_PATH=/tmp/mem S3MEM_NAMESPACE=agent target/debug/s3mem recall "rust deploy" --pretty
 ```
 
 ### Source layout
@@ -31,20 +36,39 @@ S3MEM_TEST_BUCKET=my-bucket cargo test --features s3 --test s3_store -- --nocapt
 src/
   lib.rs            crate root + re-exports + doctest of the happy path
   record.rs         OKF Record / RecordMeta / MemoryType — parse + to_markdown
-  store.rs          Store trait + Manifest/ManifestEntry (derived index)
+  store.rs          Store trait (incl. records()) + Manifest/ManifestEntry
   error.rs          Error enum (thiserror), Result alias
   util.rs           now_iso() RFC-3339 timestamp helper
+  recall/
+    mod.rs          Filter + Hit; re-exports bm25 / grep
+    bm25.rs         hand-rolled Okapi BM25 (field-weighted), ranked recall
+    grep.rs         literal/regex match with line-numbered snippets
+    tokenize.rs     shared tokenizer + snippet truncation
   backend/
-    mod.rs          backend module wiring (common + local, s3 under cfg)
+    mod.rs          backend wiring (common + local, s3 under cfg)
     common.rs       SHARED key rules: validate_id, encode_id, safe_segments (parity-critical)
     local.rs        LocalStore — Store over a directory
     s3.rs           S3Store — Store over S3 objects (feature = "s3")
+  bin/s3mem.rs      the `s3mem` CLI (feature = "cli"): remember/recall/grep/get/list/forget
+skills/s3mem-memory/SKILL.md   agent skill wrapping the CLI (when to use recall vs grep)
 tests/local_store.rs  integration tests against a temp-dir bundle
 tests/qa_probes.rs    adversarial corner-case suite (see QA_FINDINGS.md)
+tests/recall.rs       recall over a real LocalStore corpus
 tests/s3_store.rs     live S3 round-trip, gated on S3MEM_TEST_BUCKET (feature = "s3")
 ```
 
 Key implementation notes for future work:
+- **Recall is a layer over `Store`, not part of it.** `bm25`/`grep` are pure functions over a
+  `&[Record]` slice (from `Store::records()`), so they're backend-agnostic and unit-testable
+  without any store. Both run a cheap frontmatter `Filter` (type/tags) first — that's where an
+  S3 Select prefilter would plug in later.
+- **BM25 is hand-rolled** (`recall/bm25.rs`, k1=1.2/b=0.75), field-weighted by repeating tokens
+  (description ×3, id ×2, tags ×2, body ×1). No search-engine dependency; corpus is loaded and
+  scored in memory per call. Fine to thousands of notes; a cached/persisted index is the next
+  step for very large S3 bundles (every `recall` currently does one GET per object).
+- The CLI prints **JSON by default** for the recall tools (agent-parseable), `--pretty` for
+  humans. Backend/namespace come from `S3MEM_PATH`/`S3MEM_BUCKET`/`S3MEM_NAMESPACE` env vars.
+
 - `Store` is the seam, and it's **synchronous**. The AWS SDK is async, so `S3Store` owns a
   Tokio runtime and bridges each call with `block_on` — this keeps the trait, the local
   backend, and all callers sync. Don't asyncify the trait to accommodate S3.

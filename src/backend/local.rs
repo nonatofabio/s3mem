@@ -186,6 +186,10 @@ impl Store for LocalStore {
             .collect();
         Ok(Manifest { entries })
     }
+
+    fn records(&self) -> Result<Vec<Record>> {
+        Ok(self.read_entries()?.into_iter().map(|(_, r)| r).collect())
+    }
 }
 
 fn is_markdown(path: &Path) -> bool {

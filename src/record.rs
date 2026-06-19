@@ -31,6 +31,22 @@ impl std::fmt::Display for MemoryType {
     }
 }
 
+impl std::str::FromStr for MemoryType {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "semantic" => Ok(MemoryType::Semantic),
+            "episodic" => Ok(MemoryType::Episodic),
+            "procedural" => Ok(MemoryType::Procedural),
+            "reference" => Ok(MemoryType::Reference),
+            other => Err(format!(
+                "unknown memory type `{other}` (expected semantic|episodic|procedural|reference)"
+            )),
+        }
+    }
+}
+
 /// The YAML frontmatter of an OKF record — the structured, filterable fields.
 ///
 /// Field order here is the on-disk order (serde preserves struct order), chosen so a
