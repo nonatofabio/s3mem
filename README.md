@@ -171,7 +171,8 @@ copy-to-filesystem (an embedded DB, a vendor API, a non-portable index) stays in
 layer, never the core.
 
 Working in this repo? See [CLAUDE.md](CLAUDE.md) for build commands, the source map, and the
-invariants worth preserving.
+invariants worth preserving. For the plan to evaluate s3mem as a memory system, see
+[docs/benchmarking.md](docs/benchmarking.md).
 
 ## Roadmap
 
