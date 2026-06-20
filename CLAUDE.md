@@ -20,6 +20,7 @@ builds the AWS SDK. The only feature is `cli` (clap, for the binary).
 cargo test                                # full suite (both backends always built in)
 cargo build --release --features cli      # build the `s3mem` CLI
 cargo test --test recall                  # recall integration tests over a LocalStore
+cargo test --features cli --test agent_workflow  # end-to-end agent wiring (drives the CLI)
 cargo test round_trips_through_markdown   # a single test by name
 cargo clippy --all-targets --features cli # lints (kept clean)
 cargo fmt                                 # format (rustfmt)
@@ -62,6 +63,7 @@ tests/recall_probes.rs  adversarial recall-layer probes (see QA_FINDINGS.md)
 tests/recall.rs       recall over a real LocalStore corpus
 tests/cache.rs        cached-index lifecycle (write/reuse/self-heal/transparency)
 tests/graph.rs        link/unlink/neighbors over a real LocalStore
+tests/agent_workflow.rs  end-to-end: drives the CLI across two processes (feature = "cli")
 tests/s3_store.rs     live S3 round-trip, gated on S3MEM_TEST_BUCKET
 ```
 
